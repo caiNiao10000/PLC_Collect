@@ -19,4 +19,16 @@
   <ItemGroup>
     <ProjectReference Include="..\PlcDataHub.Core\PlcDataHub.Core.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <!-- NModbus 3.0.83：Step 1 实测结论见 task-7-report.md。该包带 net6.0 目标，
+         在 net8.0-windows 下由 NuGet 选中（不是 netstandard2.0 兼容路径），还原与运行均实测通过。 -->
+    <PackageReference Include="NModbus" Version="3.0.83" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- 只对测试项目开放 internal：Modbus 的请求通道抽象（IModbusRequestChannel）刻意保持 internal，
+         它是**可测性接缝**而不是公开 API。没有它，编排逻辑（按从站+区分组、位/寄存器两条读取路径、
+         逐块故障隔离、地址校验）就只能靠真起 socket 才能测；有了它，这些断言不依赖网络。
+         真实链路（NModbus + socket + 线路字节）另由 ModbusTcpWireTests 用手写 Modbus TCP 从站端到端覆盖。 -->
+    <InternalsVisibleTo Include="PlcDataHub.Protocols.Tests" />
+  </ItemGroup>
 </Project>

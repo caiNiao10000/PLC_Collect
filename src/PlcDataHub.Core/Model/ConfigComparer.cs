@@ -97,5 +97,6 @@ public static class ConfigComparer
         || (left is not null && right is not null
             && left.SlaveId == right.SlaveId
             && left.Area == right.Area
-            && left.RegisterAddress == right.RegisterAddress);
+            && left.RegisterAddress == right.RegisterAddress
+            && left.BitOffset == right.BitOffset);
 }

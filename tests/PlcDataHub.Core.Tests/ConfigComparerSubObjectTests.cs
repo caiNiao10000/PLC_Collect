@@ -32,6 +32,9 @@ public class ConfigComparerSubObjectTests
         new object[] { "SlaveId",         new ModbusAddress(2, ModbusRegisterArea.HoldingRegister, 100) },
         new object[] { "Area",            new ModbusAddress(1, ModbusRegisterArea.InputRegister,   100) },
         new object[] { "RegisterAddress", new ModbusAddress(1, ModbusRegisterArea.HoldingRegister, 200) },
+        // Task 7 给 ModbusAddress 补的寄存器内位偏移（BOOL 点用）。
+        // 少了这一行，改 BitOffset 会被热加载判成"配置未变化"而跳过重建。
+        new object[] { "BitOffset",       new ModbusAddress(1, ModbusRegisterArea.HoldingRegister, 100, 3) },
     };
 
     [Theory]
