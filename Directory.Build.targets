@@ -35,6 +35,15 @@
                Condition="'$(Configuration)' != '' and '$(TargetFramework)' == 'net8.0-windows' and '$(RuntimeIdentifier)' != '' and '$(RuntimeIdentifier)' != 'win-x64'" />
     <RemoveDir Directories="$(MSBuildProjectDirectory)\obj\$(Configuration)\$(TargetFramework)\$(RuntimeIdentifier)"
                Condition="'$(Configuration)' != '' and '$(TargetFramework)' == 'net8.0-windows' and '$(RuntimeIdentifier)' != '' and '$(RuntimeIdentifier)' != 'win-x64'" />
+
+    <!--
+      以下两条（复数 RuntimeIdentifiers 路径）是【惰性】的，不承担拦截职责：
+      ① RuntimeIdentifiers 是分号分隔的列表，而 RemoveDir 的每个路径是单个目录、不按分号拆分；
+      ② 产物目录命名用的是单数 $(RuntimeIdentifier)，复数属性从不参与目录命名。
+      真正承重的是本目标的 Condition 里的复数守卫（它负责报错）。
+      保留这两条是对"将来有人改用复数属性命名产物目录"的零成本防御 —— 请勿据此认为
+      Condition 里的守卫可以删除。
+    -->
     <RemoveDir Directories="$(MSBuildProjectDirectory)\bin\$(Configuration)\$(TargetFramework)\$(RuntimeIdentifiers)"
                Condition="'$(Configuration)' != '' and '$(TargetFramework)' == 'net8.0-windows' and '$(RuntimeIdentifiers)' != '' and '$(RuntimeIdentifiers)' != 'win-x64'" />
     <RemoveDir Directories="$(MSBuildProjectDirectory)\obj\$(Configuration)\$(TargetFramework)\$(RuntimeIdentifiers)"
