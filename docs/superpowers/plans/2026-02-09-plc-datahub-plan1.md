@@ -2649,6 +2649,19 @@ git commit -m "feat: 读块合并与字节解码
 - **小端语义 = 整值字节逆序，不是 word-swapped。** 真实 Modbus 设备有四种字节序（ABCD / DCBA / BADC / CDAB），而 `ByteOrder` 只有 `Big`/`Little`，**无法表达 word-swapped（BADC / CDAB）**。若现场遇到此类设备，需扩模型而非在连接层做特例。
 - **`String` 无长度来源**：`PointConfig` 没有字符串长度字段，`ByteWidth`/`RegisterWidth` 对 `String` 都给占位值 1。**"Modbus 字符串"在 Plan 1 数据模型里无法表达。**
 
+> **模型前置条件（Task 7 已落地，后续不得回退）**：`ModbusAddress` 现有 **4** 个字段：
+> ```csharp
+> public sealed record ModbusAddress(int SlaveId, ModbusRegisterArea Area, int RegisterAddress, int BitOffset = 0);
+> ```
+> `BitOffset` 语义务必分清：**位区**（`Coil`/`DiscreteInput`）每个地址本身就是一位，`BitOffset` 必须为 **0**；**寄存器区**（`HoldingRegister`/`InputRegister`）的 `Bool` 点用 `BitOffset ∈ 0~15` 指定寄存器内的位。
+> 该字段是 Task 7 为修一个真实缺陷而加的（`ModbusAddress` 无位偏移时，"保持寄存器的第 3 位"无处表达）；它同时触发了 Task 2 的护栏，`ConfigComparer` 已同步比较该字段。**删掉它会让寄存器内位寻址重新变得无法表达。**
+
+### 本机环境限制（影响验收构造，Plan 2 必须知悉）
+
+- **对不可达外网 IP 的连接会立即返回"已连接"**（疑似代理拦截）→ `ConnectAsync` 的**超时分支在本机构造不出来**。要构造"连不上"，只能用**环回端口拒绝**（真拒绝，约 2 秒）或真实设备。
+  → **Plan 2 的 A3（PLC 断线重连）与"连不上要报警"类验收不得依赖外网地址。**
+- 宿主是 **Windows PowerShell**（`pwsh` 不在 PATH）、执行策略**禁止运行 `.ps1`** → 脚本需用 `[scriptblock]::Create` 执行，或写成内联命令。
+
 **Files:**
 - Create: `src/PlcDataHub.Protocols/Modbus/ModbusTcpConnection.cs`
 - Create: `src/PlcDataHub.Protocols/Fake/FakePlcConnection.cs`
