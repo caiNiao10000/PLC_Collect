@@ -596,22 +596,44 @@ ToolGood.Words.Pinyin.WordsHelper.GetPinyin(string text, string splitSpan, bool 
 ```
 
 - `tone: false` → **无声调**：`GetPinyin("温度", "_", false) == "Wen_Du"`
-- `tone: true`  → **带声调**：`GetPinyin("温度", "_", true)  == "Wēn_Dù"`（**不可用**，会让列名变成 `wēn_dù`）
+- `tone: true`  → **带声调，绝不可用**：`GetPinyin("温度", "_", true) == "Wēn_Dù"`。
+  声调符号（`ē`/`ù`）是**非 ASCII**，正是规格 3.5 节要避免的东西，故必须传 `false`。
+  > 注意：**不要指望 ASCII 过滤器兜住这个错误**。`ColumnNameGenerator` 的逐字符过滤器会把
+  > `ē`/`ù` 折成下划线，于是 `温度` 会静默变成 **`w_n_d`**（而不是 `wen_du`），
+  > 是一个看起来合法但完全错误的列名。传 `false` 是唯一正确做法。
 - **返回首字母大写**（`"Wen"`），故调用方**必须** `ToLowerInvariant()`
 - **`splitSpan` 是"字符之间"的连接符，不是尾随/前导分隔符**：
   `GetPinyin("温", "_", false) == "Wen"`（单字调用**不含**分隔符）。
   因此**连续汉字必须整段交给库**；若逐字符调用再自行拼接，会得到 `"wendu"` 而非 `"wen_du"`。
-- **多音字取首项、不做词级消歧**：`GetAllPinyin('重', false) == [Zhong, Chong]`，库取 `Zhong`，
-  故"重庆"会得到 `zhong_qing`。列名仍**稳定且唯一**，不影响 DDL 正确性。
+- **多音字：孤立字取首读音；成词时库会做词级消歧**。
+  `GetAllPinyin('重', false) == [Zhong, Chong]` 且孤立字 `GetPinyin("重","_",false) == "Zhong"`；
+  但**成词 `<"重庆">` 实测为 `GetPinyin("重庆", "_", false) == "Chong_Qing"`** —— 库按词选了正确读音，
+  对应列名 `chong_qing`。（早先版本此处写"不做词级消歧、重庆→zhong_qing"，经实测证伪并订正。）
+  消歧并非总是正确，但列名**稳定且唯一**，不影响 DDL 正确性。
 - 支持范围自述 `[0x3400,0x4DB5] [0x4E00,0x9FA5]`，实测可超出。
 - **码表外的汉字是"段内逐个透传"，不是整段失败**：`GetPinyin("温鿖", "_", false) == "Wen_鿖"`。
   故调用方**必须对库输出逐字符过滤、只保留 ASCII**，
   **不能**用"整段输出是否等于输入"来判断转出是否成功 —— 那会漏掉部分透传，让非 ASCII 混进列名，
   违反规格 3.5 节"列名统一 ASCII"。（U+9FD6..U+9FFF 共 42 个码点属此形态。）
+- **码表外汉字有两种不同处置，必须区分（实测，勿混淆）**：
+
+  | 形态 | 库行为 | 例 |
+  |---|---|---|
+  | **段内透传**（U+9FD6..U+9FFF，42 个） | 该字**原样留在输出里** → 非 ASCII 泄漏 | `GetPinyin("鿖输出") == "鿖_Shu_Chu"` |
+  | **段内跳过**（U+9FD3） | 该字被**静默丢弃**，且**不留分隔符** | `GetPinyin("鿓输出") == "Shu_Chu"` |
+
+  两种形态的**最终行为都是安全的**（ASCII 过滤器把透传字折掉、跳过字本就不出现），但**机制不同**：
+  - 透传形态由 `ColumnNameGenerator` 的逐字符 ASCII 过滤器兜住；
+  - 跳过形态**不经过** `ToPinyin` 的空串分支 —— 那是**库在段内跳过**，与调用方无关。
+    空串分支只在**整段全是不可转换字**时才被进入：`GetPinyin("鿓") == ""`
+    → `Normalize("鿓")` 抛 `ArgumentException`（全无意义字符，符合契约）。
+  - 丢弃会使该字**两侧直接相接**（不留分隔符），故 `Normalize("A鿓B") == "ab"`、
+    `Normalize("鿓输出") == "shu_chu"`（与 `Normalize("输出")` 同基名，靠 `AssignUniqueColumns` 的 `_2` 避让兜底）。
+    > 早先版本把 U+9FD3 的成因写成"库返回空串 → 空串分支丢弃"，**经插桩实测证伪**：段内场景下库返回的是非空的 `"Shu_Chu"`，空串分支根本没被进入。
 - 包目标框架 `netstandard2.0/2.1` + `net40`，与 `net8.0-windows` 兼容，已实测还原与运行正常。
 
 对应实现与回归测试：`src/PlcDataHub.Core/Naming/ColumnNameGenerator.cs`、
-`tests/PlcDataHub.Core.Tests/ColumnNameGeneratorTests.cs`（含"码表外汉字透传时结果仍为纯 ASCII"用例）。
+`tests/PlcDataHub.Core.Tests/ColumnNameGeneratorTests.cs`（含"码表外汉字透传时结果仍为纯 ASCII"与"库无法转换的汉字被丢弃而不是泄漏非 ASCII"两条用例）。
 
 ### 8.2 最小依赖清单
 
