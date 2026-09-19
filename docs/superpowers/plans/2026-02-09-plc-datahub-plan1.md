@@ -1501,7 +1501,7 @@ public class MigrationPlannerTests
         var desired = new DesiredSchema(Array.Empty<DesiredTable>());
         var existing = Existing("plc01_fast", ("ts", "timestamp"), ("q", "smallint"), RowCount: 86400);
 
-        var plan = MigrationPlanner.Plan(desired, new[] { existing }, new MigrationOptions(DropRemovedTables: true));
+        var plan = MigrationPlanner.Plan(desired, new[] { existing }, new MigrationOptions(SoftDeleteRemovedColumns: true, DropRemovedTables: true));
 
         var drop = plan.Steps.Should().ContainSingle(s => s.Kind == MigrationStepKind.DropTable).Subject;
         drop.IsDestructive.Should().BeTrue();
@@ -3201,21 +3201,19 @@ public sealed class SchemaIntrospector
             return Array.Empty<ExistingTable>();
         }
 
-        // 行数单独查。用 pg_class.reltuples 是估算值，这里必须精确，因为要写进破坏性操作提示里。
+        // 行数单独查。必须用 count(*) 精确统计：
+        // pg_class.reltuples 在表刚建、尚未 ANALYZE 时返回 -1，而迁移预览要报给用户
+        // "将丢弃 N 行"的真实数字。表数量在 5~15 张量级，逐表 count(*) 的开销可接受。
         await using (var countCommand = connection.CreateCommand())
         {
-            countCommand.CommandText = """
-                select c.relname, c.reltuples::bigint
-                from pg_class c
-                join pg_namespace n on n.oid = c.relnamespace
-                where n.nspname = @schema and c.relkind = 'r'
-                """;
-            countCommand.Parameters.AddWithValue("schema", MigrationPlanner.DataSchema);
+            var tableNames = columnsByTable.Keys.ToList();
 
-            await using var reader = await countCommand.ExecuteReaderAsync(cancellationToken);
-            while (await reader.ReadAsync(cancellationToken))
+            foreach (var tableName in tableNames)
             {
-                rowCounts[reader.GetString(0)] = reader.GetInt64(1);
+                await using var perTable = connection.CreateCommand();
+                perTable.CommandText = $"select count(*) from {MigrationPlanner.DataSchema}.\"{tableName}\"";
+                var scalar = await perTable.ExecuteScalarAsync(cancellationToken);
+                rowCounts[tableName] = scalar is long value ? value : 0L;
             }
         }
 
@@ -3229,10 +3227,9 @@ public sealed class SchemaIntrospector
 }
 ```
 
-> **实现提示**：`pg_class.reltuples` 是估算值。若要求精确行数，把上面第二个查询
-> 改为对每张表执行 `select count(*)`——表数量少（几个到十几个）时完全可接受，且提示更准确。
-> 计划里先用 `reltuples` 保证实现简单，**并在 Task 11 的验收里核对提示行数是否合理**；
-> 若偏差明显，改成 `count(*)`。
+> **实现提示**：行数用 `count(*)` 精确统计（实现里已经这样写）。
+> 不要改回 `pg_class.reltuples`——它在表刚建、尚未 ANALYZE 时返回 **-1**，
+> 会让 Step 3 的测试断言 `RowCount == 7` 必然失败，也会让迁移预览把"将丢弃 -1 行"显示给用户。
 
 - [ ] **Step 5: 运行测试**
 

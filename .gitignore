@@ -30,3 +30,6 @@ TestResults/
 # ===== 操作系统 =====
 Thumbs.db
 desktop.ini
+
+# ===== SDD 工作区（规格/计划的临时产物，非交付物）=====
+.superpowers/
