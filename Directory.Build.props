@@ -1,0 +1,18 @@
+<Project>
+  <!--
+    全工程统一构建属性。任何 csproj 都不得单独覆盖 TargetFramework。
+    原因见 docs/specs/2026-02-09-plc-datahub-design.md 1.5 节：
+    .NET 9 / .NET 10 已放弃 Windows 10 支持，升级会导致 Win10 工控机无法运行。
+    本机装有 .NET 10 运行时，此风险实际存在。
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>12</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <InvariantGlobalization>false</InvariantGlobalization>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+  </PropertyGroup>
+</Project>

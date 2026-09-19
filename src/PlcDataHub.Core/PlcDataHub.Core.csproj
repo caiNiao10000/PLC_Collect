@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- 刻意不写 TargetFramework：由 Directory.Build.props 统一提供 -->
+  <PropertyGroup>
+    <RootNamespace>PlcDataHub.Core</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <!--
+      必须排除 tests 子目录。SDK 风格项目默认把目录树下的所有 .cs 都编译进来，
+      如果测试项目建在本项目的子目录里，测试源码会被编进类库并报
+      "未能找到类型或命名空间名 Xunit" —— 而且错误会指向类库，极难排查。
+      本机已实测踩到这个坑。见 Task 6 / Task 8 的模板生成命令。
+    -->
+    <Compile Remove="tests\**" />
+    <None Remove="tests\**" />
+  </ItemGroup>
+</Project>
