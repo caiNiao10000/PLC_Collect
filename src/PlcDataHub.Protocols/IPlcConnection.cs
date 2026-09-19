@@ -45,6 +45,19 @@ public enum ConnectionFailureKind
     /// 传输层故障（超时、连接被重置、读写失败、传输对象已释放）。链路不可用：**该重连**。
     /// </summary>
     Transport,
+
+    /// <summary>
+    /// **未预期的异常**：不属于传输类白名单，也不是配置错误——即"链路坏了"与"配置错了"都解释不了它
+    /// （典型来源是库的内部状态：设备消失/对端 RST 之后，NModbus 从第二次调用起恒抛
+    /// <see cref="InvalidOperationException"/>）。
+    /// <para>
+    /// 处置与 <see cref="Transport"/> 相同：**该重连**。理由：能从一个 socket 上抛出未知异常，
+    /// 说明这条连接的状态已不可信；不重连就会"每轮都抛同一个异常、永不恢复"。
+    /// 与 <see cref="Transport"/> 分开是为了让运行状态能区分"链路坏（现场问题）"与
+    /// "库/代码缺陷（软件问题）"——两者的排查方向完全不同。
+    /// </para>
+    /// </summary>
+    Unexpected,
 }
 
 /// <summary>最近一次失败的摘要：类别 + 可读消息（消息里应包含点标识或从站/地址等定位信息）。</summary>
@@ -61,11 +74,13 @@ public sealed record ConnectionFailure(ConnectionFailureKind Kind, string Messag
 /// <list type="number">
 ///   <item><see cref="ConnectAsync"/> 失败抛异常，由采集器的重连逻辑处理；失败也会写入 <see cref="LastError"/>。</item>
 ///   <item><see cref="ReadAsync"/> 单轮内的**块级**失败不抛异常：该块的点值为 null，其余块照常；失败写入 <see cref="LastError"/>。</item>
-///   <item>传输层故障会把 <see cref="IsConnected"/> 置 false，此后 <see cref="ReadAsync"/> **抛
-///         <see cref="InvalidOperationException"/>**（"尚未连接"），采集器必须重新
-///         <see cref="ConnectAsync"/> 才能继续——**不要**在一个已判定失效的连接上继续读。</item>
-///   <item>配置错误（不支持的数据类型、非法地址等）**抛异常且不写 LastError**：它们在使用前就暴露，
-///         异常本身就是信号（消息里带点标识）。</item>
+///   <item>传输类故障（<see cref="ConnectionFailureKind.Transport"/>）与**未预期的异常**
+///         （<see cref="ConnectionFailureKind.Unexpected"/>）都会把 <see cref="IsConnected"/> 置 false，
+///         此后 <see cref="ReadAsync"/> **抛 <see cref="InvalidOperationException"/>**（"尚未连接"），
+///         采集器必须重新 <see cref="ConnectAsync"/> 才能继续——**不要**在一个已判定失效的连接上继续读。</item>
+///   <item>配置错误（不支持的数据类型、非法地址、从站号越界等，异常类型是 <see cref="ArgumentException"/>
+///         家族或 <see cref="NotSupportedException"/>）**抛异常但不置 false、也不写 LastError**：
+///         它们在使用前就暴露，**异常本身就是信号**（消息里带点标识），连接状态并没有因此不可信。</item>
 /// </list>
 /// </para>
 /// </remarks>
@@ -87,7 +102,13 @@ public interface IPlcConnection : IDisposable
     /// 而操作员要看的正是"有没有出过错、错在哪一类"。要判断"此刻是否正常"请看 <see cref="IsConnected"/>
     /// 与本轮的返回值。
     /// </para>
-    /// <para>不抛异常的失败（从站拒绝、传输故障）**必须**写入本属性；抛异常的失败也应写入。</para>
+    /// <para>
+    /// **哪些失败会写入本属性**（与上面的失败契约逐条对应）：
+    /// 不抛异常的失败（从站拒绝 <see cref="ConnectionFailureKind.SlaveRejected"/>、
+    /// 传输故障 <see cref="ConnectionFailureKind.Transport"/>）**必须**写入；
+    /// 未预期的异常（<see cref="ConnectionFailureKind.Unexpected"/>）在冒泡前写入；
+    /// <b>配置错误**不写**</b>——它抛异常、连接状态并未因此不可信，异常本身就是信号。
+    /// </para>
     /// </summary>
     ConnectionFailure? LastError { get; }
 }

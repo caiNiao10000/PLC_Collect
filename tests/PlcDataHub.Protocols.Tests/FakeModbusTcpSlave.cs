@@ -59,6 +59,17 @@ internal sealed class FakeModbusTcpSlave : IDisposable
     /// <summary>为 true 时只收不回（用于构造"读到超时"的真实场景）。</summary>
     internal bool Mute { get; set; }
 
+    /// <summary>
+    /// 收到第 N 个请求时**放弃式关闭**这条连接（在写回响应之前，发 RST），
+    /// 用于构造"设备在采集过程中消失 / 网线被拔"。0（默认）= 不中止。
+    /// <para>
+    /// 选"收到第 N 个请求就 RST"而不是"写回第 N 个响应后再 RST"，是为了**确定性**：
+    /// 后者与客户端的读取存在竞争（响应可能已进内核缓冲区、也可能已被 RST 丢弃），
+    /// 测试会时而"这次读成功"、时而"这次读失败"。前者保证"第 N-1 次读一定成功、第 N 次一定失败"。
+    /// </para>
+    /// </summary>
+    internal int AbortOnRequestNumber { get; set; }
+
     /// <summary>取（必要时创建）某个从站号的内存区。</summary>
     internal FakeSlaveMemory Slave(byte unitId)
     {
@@ -134,6 +145,9 @@ internal sealed class FakeModbusTcpSlave : IDisposable
             var stream = client.GetStream();
             var header = new byte[7];
 
+            // 本次连接已收到的请求数（AbortOnRequestNumber 用；按连接计数，不看全局）。
+            var requestsReceived = 0;
+
             while (!_cts.IsCancellationRequested)
             {
                 if (!await ReadExactAsync(stream, header))
@@ -162,9 +176,35 @@ internal sealed class FakeModbusTcpSlave : IDisposable
 
                 var response = BuildResponse(transactionId, protocolId, unitId, pdu);
 
+                if (AbortOnRequestNumber > 0 && ++requestsReceived >= AbortOnRequestNumber)
+                {
+                    // 收到第 N 个请求就消失：**先记录请求（BuildResponse 里已记）、不回响应、直接 RST**。
+                    // 这是"设备突然消失/网线被拔"最接近的本机形态，而且没有竞态（见属性注释）。
+                    Abort(client);
+                    return;
+                }
+
                 await stream.WriteAsync(response, _cts.Token);
                 await stream.FlushAsync(_cts.Token);
             }
+        }
+    }
+
+    /// <summary>放弃式关闭：SO_LINGER(timeout 0) + Close 会发 RST 而不是正常的 FIN。</summary>
+    private static void Abort(TcpClient client)
+    {
+        try
+        {
+            client.Client.LingerState = new LingerOption(enable: true, seconds: 0);
+            client.Client.Close();
+        }
+        catch (SocketException)
+        {
+            // 对端已经先关了：目的（让这条连接消失）已经达到。
+        }
+        catch (ObjectDisposedException)
+        {
+            // 同上。
         }
     }
 

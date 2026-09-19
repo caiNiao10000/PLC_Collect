@@ -77,18 +77,27 @@ public sealed record ModbusTcpOptions(
 ///         <description>该块的点写 NULL、<b>IsConnected 置 false</b>、写入 <see cref="LastError"/>；
 ///         **本轮剩余块一律不再发请求**（见 <see cref="ReadAsync"/> 的 linkDown 说明），
 ///         之后必须重新 <see cref="ConnectAsync"/> 才能继续读。</description></item>
+///   <item><term>**未预期的异常**（不在传输白名单、也不是配置错误）</term>
+///         <description>**原样冒泡**（绝不降级成坏点：那会把库/代码缺陷伪装成"偶发读失败"），
+///         但**同样把 IsConnected 置 false** 并写入 <see cref="LastError"/>
+///         （类别 <see cref="ConnectionFailureKind.Unexpected"/>）。
+///         这条是修复轮 2 补的：实测设备消失/对端 RST 之后 NModbus 从第二次调用起恒抛
+///         <see cref="InvalidOperationException"/>（不在白名单里）——
+///         不标失效就会"每轮抛同一个异常、永不重连、采集彻底停摆"。</description></item>
 /// </list>
-/// 取消（<see cref="OperationCanceledException"/>）与上述三者都不同：<b>一律冒泡</b>，它不是"这个点本轮坏了"。
-/// **白名单之外**的异常同样冒泡：用 catch-all 把它们伪装成"本块偶发读失败"会让库/代码缺陷永远失去信号。
+/// 取消（<see cref="OperationCanceledException"/>）与上述各类都不同：**一律冒泡且不标失效**，
+/// 它不是"这个点本轮坏了"，也不是链路的问题。
 /// </para>
 /// <para>
 /// <b>IsConnected 的恢复语义（只有 <see cref="ConnectAsync"/> 能把它置回 true）</b>：
 /// 一次传输失败就意味着"这条连接对象不可再信"——**读超时后从站可能仍会把那次响应发回来**，
 /// 复用同一个 socket 会让下一个请求捡到上一条迟到帧（错值且不报错）。
-/// 故：传输失败 → <c>IsConnected = false</c> → 下一轮 <see cref="ReadAsync"/> **抛
+/// 故：传输失败或未预期异常 → <c>IsConnected = false</c> → 下一轮 <see cref="ReadAsync"/> **抛
 /// <see cref="InvalidOperationException"/>**（"尚未连接，不能读取"）→ 采集器的重连逻辑
 /// 必须重新 <see cref="ConnectAsync"/>（它内部会释放旧 socket 并新建）。
 /// **不存在"块失败后继续在同一 socket 上读下一轮"的路径**，因此也不会有"标死却还在用"的自相矛盾。
+/// 配置错误是唯一的例外：它抛异常但**不**标失效（连接状态没有因此不可信），
+/// 采集器修好配置即可继续用同一条连接。
 /// </para>
 /// <para>
 /// <b>返回的是原始值</b>：未乘 Scale、未加 Offset（规格 3.4 节要求工程值转换在落库前完成）。
@@ -255,6 +264,18 @@ public sealed class ModbusTcpConnection : IPlcConnection
     /// 一轮十块能拖到几十秒，而这期间没有任何信号。
     /// 之后 <see cref="IsConnected"/> 为 false，下次调用本方法会抛 <see cref="InvalidOperationException"/>，
     /// 采集器必须重新 <see cref="ConnectAsync"/>（理由见类注释的"IsConnected 的恢复语义"）。
+    /// <para>
+    /// ⚠️ <b>中止的范围是"整轮"，含其它从站与其它寄存器区</b>（不是"只跳过同组的剩余块"）。
+    /// 这么定的理由：危险的是**复用同一个 socket**，而 socket 是本连接独占的、与从站号无关——
+    /// 一条 Modbus TCP 连接上所有从站共用它。故链路一旦失效，本轮继续读任何从站都是在同一条可疑 socket 上读。
+    /// </para>
+    /// <para>
+    /// <b>代价有界（这是"整轮中止"可以接受的理由）</b>：中止时 <see cref="IsConnected"/> 已为 false，
+    /// 下一轮调用本方法会**直接抛**（一个请求都不发），采集器必须重连——
+    /// 于是"本可成功的那些块"最多**延后一轮**就会被发现并恢复，而不是被永久丢弃。
+    /// 若将来要把它收窄成"只跳过同组"，需要先论证"同一个 socket 的部分失败不会污染其它从站"，
+    /// 而这正是修复轮 1 所否定的假设。
+    /// </para>
     /// </remarks>
     /// <exception cref="InvalidOperationException">尚未连接（含上一轮发生过传输故障的情形）。</exception>
     /// <exception cref="ArgumentNullException"><paramref name="points"/> 为 null。</exception>
@@ -438,10 +459,26 @@ public sealed class ModbusTcpConnection : IPlcConnection
             MarkBlockPointsBad(block, values);
             return false;
         }
+        catch (Exception ex)
+        {
+            // 未知异常：**必须冒泡**（把库/代码缺陷伪装成"本块偶发读失败"是 C2 那一类失效），
+            // 但**同样必须把连接标记为失效**（修复轮 2 补上，理由见方法末尾的注释）：
+            // 能从这个 socket 上抛出的未知异常说明链路状态已不可信；不标记的话下一轮会放行、
+            // 继续在同一条可疑 socket 上读——"标死却还在用"的同型矛盾只是换了个触发条件。
+            //
+            // 实测：设备消失/对端 RST 之后 NModbus 从第二次调用起恒抛 InvalidOperationException
+            // （既不是传输白名单里的类型，也不是配置错误）。不在此标失效 =
+            // 每一轮都抛同一个异常、永不重连、采集彻底停摆。
+            //
+            // 这里**不标坏点**：异常会冒泡，本轮根本不会返回 ReadResult，标了也没有消费者。
+            IsConnected = false;
+            LastError = new ConnectionFailure(
+                ConnectionFailureKind.Unexpected,
+                $"从站 {slaveId} 的 {area} 区读块（起始 {block.StartAddress}，长度 {block.Length}）抛出未预期的异常："
+                + $"{ex.GetType().Name}: {ex.Message}。连接已标记失效，请重连；若反复出现请按软件缺陷排查。");
 
-        // 这里刻意**没有** catch-all：不在白名单里的异常一律冒泡。
-        // catch-all 会把库/代码缺陷（例如 NModbus 的参数校验失败、序列化错误）伪装成
-        // "本块偶发读失败"，让缺陷永远只表现为"某些点没数据"——与 C2 是同一类失效。
+            throw;
+        }
     }
 
     /// <summary>

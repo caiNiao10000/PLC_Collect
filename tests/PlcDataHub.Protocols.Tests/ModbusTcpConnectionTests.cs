@@ -360,10 +360,15 @@ public class ModbusTcpConnectionTests
     }
 
     [Fact]
-    public async Task 白名单之外的异常不被吞成坏点_而是冒泡()
+    public async Task 白名单之外的异常既冒泡也把连接标记为失效()
     {
-        // catch-all 会把库/代码缺陷（例如 NModbus 的参数校验失败）伪装成"本块偶发读失败"，
-        // 让缺陷永远只表现为"某些点没数据"——与 C2 是同一类失效。故只认传输类白名单。
+        // 两条性质一起钉住：
+        // ① **必须冒泡**——catch-all 会把库/代码缺陷（例如 NModbus 的内部状态错误）伪装成
+        //    "本块偶发读失败"，让缺陷永远只表现为"某些点没数据"（与 C2 同类失效）；
+        // ② **必须把连接标记为失效**——能从这个 socket 上抛出的未知异常说明链路状态已不可信。
+        //    修复轮 2 之前这里只冒泡、不标失效，于是下一轮会放行、继续在同一条可疑 socket 上读
+        //    ——"标死却还在用"的同型矛盾换了个触发条件（实测：设备消失/对端 RST 后
+        //    NModbus 从第二次调用起恒抛 InvalidOperationException）。
         var stub = new StubModbusChannel();
         stub.FailWith(1, ModbusRegisterArea.HoldingRegister, () => new InvalidOperationException("模拟：库内部状态错误"));
         using var connection = await ConnectedAsync(stub);
@@ -371,7 +376,28 @@ public class ModbusTcpConnectionTests
         var act = async () => await connection.ReadAsync(new[] { Word(1, 100) }, CancellationToken.None);
 
         await act.Should().ThrowAsync<InvalidOperationException>().WithMessage("*库内部状态错误*");
-        connection.IsConnected.Should().BeTrue("未知异常不该顺带把连接标死");
+        connection.IsConnected.Should().BeFalse("未知异常同样说明链路不可信，必须让采集器重连");
+        connection.LastError.Should().NotBeNull();
+        connection.LastError!.Kind.Should().Be(ConnectionFailureKind.Unexpected);
+        connection.LastError.Message.Should().Contain("InvalidOperationException").And.Contain("库内部状态错误");
+    }
+
+    [Fact]
+    public async Task 未知异常之后_下一轮读取抛尚未连接而不复用可疑连接()
+    {
+        // 上一条用例的"后果"：未知异常标失效之后，绝不允许再在同一连接上读
+        // （这正是"每轮都抛、永不重连、采集彻底停摆"那条失效路径的回归网）。
+        var stub = new StubModbusChannel();
+        stub.FailWith(1, ModbusRegisterArea.HoldingRegister, () => new InvalidOperationException("模拟：库内部状态错误"));
+        using var connection = await ConnectedAsync(stub);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => connection.ReadAsync(new[] { Word(1, 100) }, CancellationToken.None));
+
+        var act = async () => await connection.ReadAsync(new[] { Word(1, 100) }, CancellationToken.None);
+
+        await act.Should().ThrowAsync<InvalidOperationException>().WithMessage("*尚未连接*");
+        stub.Calls.Should().ContainSingle("标失效之后一个请求都不许再发");
     }
 
     // ================= 修复 2：首个传输失败后本轮不再发请求 =================

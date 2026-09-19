@@ -224,6 +224,39 @@ public class ModbusTcpWireTests
     }
 
     [Fact]
+    public async Task 端到端_从站在采集中消失_该轮记坏点并把连接标记失效_之后不再发任何请求()
+    {
+        // "设备消失"的本机形态：第 2 个请求到达时放弃式关闭（SO_LINGER 0 → RST），不回响应。
+        // **实测（探针，报告 R2-1 有完整输出）**：
+        //   CALL1 → 100（设备正常，IsConnected=true、LastError=null）
+        //   CALL2 → null、IsConnected=false、LastError=Transport（IOException: 远程主机强迫关闭了一个现有的连接），**不冒泡**
+        //   CALL3 → InvalidOperationException("尚未连接，不能读取"）——本类的守卫，且从站**一个请求都没再收到**
+        // 关键回归点：绝不出现"每轮都在同一条可疑 socket 上读、每轮抛异常、永不重连"。
+        using var slave = new FakeModbusTcpSlave { AbortOnRequestNumber = 2 };
+        slave.Slave(1).HoldingRegisters[100] = 0x0064;
+
+        using var connection = await ConnectedAsync(slave);
+        var points = new[] { Word(1, 100) };
+
+        var first = await connection.ReadAsync(points, CancellationToken.None);
+        first.Values[points[0]].Should().Be(100.0, "设备消失之前是正常的（这一步把'先正常、后消失'钉住）");
+        connection.IsConnected.Should().BeTrue();
+
+        var second = await connection.ReadAsync(points, CancellationToken.None);
+        second.Values[points[0]].Should().BeNull("对端已 RST：这一轮是坏点，而不是异常冒泡");
+        connection.IsConnected.Should().BeFalse("链路已不可信，必须让采集器重连");
+        connection.LastError.Should().NotBeNull();
+        connection.LastError!.Kind.Should().Be(ConnectionFailureKind.Transport);
+        connection.LastError.Message.Should().Contain(nameof(IOException), "实测：本机对端 RST 表现为 IOException");
+        slave.Requests.Should().HaveCount(2, "第 2 个请求就是触发 RST 的那个");
+
+        var act = async () => await connection.ReadAsync(points, CancellationToken.None);
+
+        await act.Should().ThrowAsync<InvalidOperationException>().WithMessage("*尚未连接*");
+        slave.Requests.Should().HaveCount(2, "判失效之后一个请求都不许再发（否则就是'每轮都抛、永不重连'）");
+    }
+
+    [Fact]
     public async Task 端到端_两个_BOOL_点共用同一寄存器时各取各位()
     {
         using var slave = new FakeModbusTcpSlave();

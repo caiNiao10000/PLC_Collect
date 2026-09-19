@@ -35,6 +35,9 @@ namespace PlcDataHub.Protocols.Fake;
 /// </list>
 /// 两个值分别对应真实连接的两种失败分支，**不是风格差异**：Plan 2 用假连接验证重连策略时，
 /// 若只能用 <c>false</c> 一种形态，结论会与真实设备相反。
+/// <para>
+/// ⚠️ 粒度是**整轮所有点**；真实连接的 <c>SlaveException</c> 只影响**一个读块**（见类注释的残余分叉）。
+/// </para>
 /// </param>
 public sealed record FakePlcResponse(
     bool FailConnect,
@@ -76,9 +79,16 @@ public sealed record FakePlcScript(IReadOnlyList<FakePlcResponse> Responses);
 /// （未乘 Scale / 未加 Offset，规格 3.4 节规定工程值转换在落库前由上层做）。
 /// </para>
 /// <para>
-/// ⚠️ <b>它仍与真实连接有一处结构性差异</b>：脚本按"点自己的字节缓冲区"给数据，
-/// 而真实连接解码的是"整块合并读回的字节流"。**用假连接验证不了"读块合并的字节偏移"**——
-/// 那部分由 <c>ModbusTcpConnectionTests</c> 与 <c>ModbusTcpWireTests</c> 覆盖。
+/// ⚠️ <b>它仍与真实连接有两处结构性差异</b>（修复轮 2 逐条列明，用假连接做验证时请避开这两个盲区）：
+/// <list type="number">
+///   <item><b>脚本按"点自己的字节缓冲区"给数据</b>，而真实连接解码的是"整块合并读回的字节流"。
+///         **用假连接验证不了"读块合并的字节偏移"**——那部分由 <c>ModbusTcpConnectionTests</c>
+///         与 <c>ModbusTcpWireTests</c> 覆盖。</item>
+///   <item><b><see cref="FakePlcResponse.KeepConnected"/> 的粒度是"整轮"</b>，
+///         而真实连接的 <c>SlaveException</c> 粒度是"**单个读块**"（同轮其它块仍会成功）。
+///         要表达"部分块被拒绝、其余块正常"，请用"<c>DataByPointId</c> 里缺这些点的条目"——
+///         那才是与真实形态一致的表达方式（缺条目 = 该点坏值、连接保持）。</item>
+/// </list>
 /// </para>
 /// </remarks>
 public sealed class FakePlcConnection : IPlcConnection
@@ -195,23 +205,26 @@ public sealed class FakePlcConnection : IPlcConnection
                 response.KeepConnected ? ConnectionFailureKind.SlaveRejected : ConnectionFailureKind.Transport,
                 response.ErrorMessage ?? "假连接：读失败");
 
-            foreach (var point in points)
+            // 只对**本协议的点**写坏值（与成功路径同一集合），其余点由下面的补齐循环得到 null。
+            // 修复轮 2 之前这里对 `points` 全量写 NULL，于是"协议筛点是否真的执行"在失败轮里
+            // 被完全遮蔽——成功路径与失败路径用两套点集，是同一类分叉的温床。
+            foreach (var point in ownedPoints)
             {
                 values[point] = null;
             }
-
-            return Task.FromResult(new ReadResult(values));
         }
-
-        foreach (var point in ownedPoints)
+        else
         {
-            if (!response.DataByPointId.TryGetValue(point.PointId, out var bytes))
+            foreach (var point in ownedPoints)
             {
-                values[point] = null;
-                continue;
-            }
+                if (!response.DataByPointId.TryGetValue(point.PointId, out var bytes))
+                {
+                    values[point] = null;
+                    continue;
+                }
 
-            values[point] = Decode(point, bytes);
+                values[point] = Decode(point, bytes);
+            }
         }
 
         // 不属于本协议的点、以及脚本没有给字节的点，都要有条目（契约：每个传入的点都有条目）。
