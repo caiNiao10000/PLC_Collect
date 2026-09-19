@@ -60,6 +60,62 @@ public class DesiredSchemaColumnCaseGuardTests
         names.Should().Contain("wen_du_2");
     }
 
+    /// <summary>
+    /// 兜底避让是**裸拼接**（<c>$"{基名}_{序号}"</c>），不经 <c>ColumnNameGenerator</c> 的字节预算，
+    /// 故基名恰为 63 字节时避让会产出 65 字节列名。
+    /// PostgreSQL 对超长标识符是**静默截断**：截断回 63 字节后与触发避让的那个手工列同名，
+    /// 建表报 duplicate column name。大小写守卫看不见它（它只查大小写），必须由字节守卫拦住。
+    /// </summary>
+    [Fact]
+    public void 列名超过_63_字节时抛异常而不是静默超限()
+    {
+        var longName = new string('a', 63);
+
+        var act = () => Build(new[]
+        {
+            MakePoint(1, "手工点", longName),
+            MakePoint(2, longName, ""),
+        });
+
+        act.Should().Throw<InvalidOperationException>()
+            .WithMessage("*65*63*");
+    }
+
+    /// <summary>
+    /// 边界对照：恰好 63 字节是合法上限，不得被守卫误杀。
+    /// 若把检查写成 <c>&gt;=</c>，本用例变红。
+    /// </summary>
+    [Fact]
+    public void 恰好_63_字节的列名不被误杀()
+    {
+        var exactName = new string('a', 63);
+
+        var schema = Build(new[] { MakePoint(1, "手工点", exactName) });
+
+        var names = schema.Tables.Single().Columns.Select(c => c.Name).ToList();
+
+        names.Should().Contain(exactName);
+        names.Should().OnlyHaveUniqueItems();
+    }
+
+    /// <summary>
+    /// 措辞：**完全相同**的重复列名不该被说成"仅大小写不同"——那是最可能收到的真实场景，
+    /// 误导性诊断会把用户引到错误方向。
+    /// </summary>
+    [Fact]
+    public void 完全相同的重复列名给出准确措辞()
+    {
+        var act = () => Build(new[]
+        {
+            MakePoint(1, "点甲", "wen_du"),
+            MakePoint(2, "点乙", "wen_du"),
+        });
+
+        act.Should().Throw<InvalidOperationException>()
+            .WithMessage("*存在重复列名*")
+            .WithMessage("*wen_du*");
+    }
+
     private static DesiredSchema Build(IReadOnlyList<PointConfig> points) =>
         DesiredSchemaBuilder.Build(
             new[] { MakeConnection() },

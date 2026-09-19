@@ -28,27 +28,40 @@ public class DesiredSchemaBuilderTests
     }
 
     /// <summary>
-    /// 类型映射的**覆盖护栏**。上一条 Theory 是逐条 <see cref="InlineDataAttribute"/> 列出的，
-    /// 将来给 <see cref="PointDataType"/> 加了枚举成员却忘记补映射时，
-    /// SqlTypeMapper 抛 ArgumentOutOfRangeException 与否都不会让上一条 Theory 变红 —— 那正是静默漏测。
-    /// 本用例把"枚举成员集合"与"Theory 实际断言过的类型集合"直接比对，缺一即失败。
-    /// 反射遍历的是测试程序集自身的类型，不读源码文件，故不受文件系统影响。
+    /// 类型映射的**覆盖护栏**（与上一条 Theory 配套，两者必须同步）。
+    /// <para>
+    /// 上一条 Theory 是逐条 <see cref="InlineDataAttribute"/> 列出的，将来给
+    /// <see cref="PointDataType"/> 加了枚举成员、却只更新了 <see cref="SqlTypeMapper"/> 或只更新了
+    /// Theory 数据时，都会在本用例被拦下：
+    /// 枚举成员数与 Theory 条数**必须相等**，任一侧单方面变动都会让等号破裂。
+    /// </para>
+    /// <para>
+    /// 这里刻意**不去反射读 Theory 上的 InlineData 值** —— 那需要调
+    /// <c>InlineDataAttribute.GetData(null!)</c>，依赖"xunit 当前版本不校验该参数"这一
+    /// **未承诺行为**，将来升级 xunit 会以与业务无关的方式变红。
+    /// 改为从 <c>Enum.GetValues</c> 推导期望条数：它遍历的是**每一个**枚举成员，
+    /// 是编译期事实，不依赖任何未承诺的运行时行为。
+    /// <c>14</c> 不是随手写的常量 —— 它是"枚举成员数"，本用例就是要求 Theory 与它一一对应。
+    /// </para>
     /// </summary>
     [Fact]
     public void 类型映射测试覆盖了全部数据类型枚举成员()
     {
-        var inlineDataTypes = typeof(DesiredSchemaBuilderTests).Assembly
-            .GetTypes()
-            .SelectMany(t => t.GetMethods())
-            .Where(m => m.Name == nameof(类型映射符合规格_3_4_节))
-            .SelectMany(m => m.GetCustomAttributes(typeof(InlineDataAttribute), inherit: false))
-            .Cast<InlineDataAttribute>()
-            .Select(a => (PointDataType)a.GetData(null!).Single()[0])
-            .ToHashSet();
+        var enumMembers = Enum.GetValues<PointDataType>();
 
-        inlineDataTypes.Should().BeEquivalentTo(
-            Enum.GetValues<PointDataType>(),
-            "每条映射都必须被断言，新增枚举成员时请同步补 Theory 数据与 SqlTypeMapper 映射");
+        // Theory 的 [InlineData] 条目数与枚举成员数必须相等（当前各 14 条）
+        typeof(DesiredSchemaBuilderTests).GetMethod(nameof(类型映射符合规格_3_4_节))!
+            .GetCustomAttributes(typeof(InlineDataAttribute), inherit: false)
+            .Length
+            .Should().Be(
+                enumMembers.Length,
+                "Theory 必须为每个枚举成员各列一条断言；新增枚举成员时请同步补 Theory 数据与映射");
+
+        // 且每个成员都必须真的能映射（漏映射会让 SqlTypeMapper 抛异常）
+        foreach (var member in enumMembers)
+        {
+            SqlTypeMapper.ToPostgresType(member).Should().NotBeNullOrWhiteSpace();
+        }
     }
 
     [Fact]
@@ -193,6 +206,48 @@ public class DesiredSchemaBuilderTests
         names.Should().HaveCount(17);
         names.Should().NotContainNulls();
         names.Should().OnlyContain(n => n.Length > 0);
+    }
+
+    /// <summary>
+    /// 兜底避让的**终止性**：序号必须递增，否则当候选名**恒被占用**时会死循环。
+    /// 两个手工列名占住 wen_du 与 wen_du_2，自动点（显示名"温度"）的基名是 wen_du：
+    /// 候选 wen_du 被占 → wen_du_2 也被占 → 只有序号继续递增到 wen_du_3 才能跳出 while。
+    /// 若序号不递增，候选恒为 wen_du_2、恒判占用 ⇒ **死循环**（本用例将挂住而非失败）。
+    /// 实测该场景真实输出：ts | q | src_ts | wen_du | wen_du_2 | wen_du_3。
+    /// 除唯一性外**额外锁死** wen_du_3 —— 这是全任务唯一锁具体列名之处，理由见用例内注释：
+    /// 它是"序号递增"的唯一可观测证据，且能返回的实现在此不存在其它可能取值。
+    /// </summary>
+    [Fact]
+    public void 候选名被手工名连环占用时仍能终止且列名唯一()
+    {
+        var schema = DesiredSchemaBuilder.Build(
+            new[] { MakeConnection() },
+            new[]
+            {
+                MakeGroup(new[]
+                {
+                    MakePoint(1, "手工点甲", "wen_du"),
+                    MakePoint(2, "手工点乙", "wen_du_2"),
+                    MakePoint(3, "温度", ""),
+                }),
+            });
+
+        var names = schema.Tables.Single().Columns.Select(c => c.Name).ToList();
+        var autoName = names[5];
+
+        names.Should().OnlyHaveUniqueItems();
+        names.Should().Contain("wen_du", "手工列名必须原样保留");
+        names.Should().Contain("wen_du_2", "手工列名必须原样保留");
+
+        // 先只断言"自动名不与任何手工名冲突"（不锁具体避让风格）
+        autoName.Should().NotBe("wen_du");
+        autoName.Should().NotBe("wen_du_2");
+
+        // 此处是本任务**唯一**锁死具体列名的断言，理由：它是"序号递增"的唯一可观测证据。
+        // 走完第 2 轮的唯一方式是序号由 2 递增到 3；若序号不递增，候选恒为 wen_du_2、
+        // 恒判占用 ⇒ 死循环（该实现根本无法返回）。因此一个能正常返回的实现在此**只可能**是
+        // wen_du_3 —— 两个手工名已占死前两个候选，没有别的命名风格可选。
+        names[5].Should().Be("wen_du_3", "序号必须递增才能跳出避让循环，否则死循环");
     }
 
     private static DeviceConnection MakeConnection() => new(
