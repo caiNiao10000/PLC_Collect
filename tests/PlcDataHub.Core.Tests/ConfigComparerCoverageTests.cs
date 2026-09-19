@@ -335,8 +335,9 @@ public class ConfigComparerCoverageTests
 
     /// <summary>
     /// 提取指定方法的方法体源码。同时支持<b>表达式体</b>（<c>=&gt; …;</c>）与<b>块体</b>（<c>{ … }</c>），
-    /// 因为 ConfigComparer 里两种写法都有：PointEquivalent / GroupsEquivalent / S7Equivalent /
-    /// ModbusEquivalent 是表达式体，PointsEquivalent 是块体。
+    /// 因为 ConfigComparer 里两种写法都有：PointEquivalent / GroupsEquivalent /
+    /// PointsEquivalent 是块体（前两者为加参数校验改成了块体），
+    /// S7Equivalent / ModbusEquivalent 是表达式体。
     /// </summary>
     private static string ReadMethodBody(string fileName, string methodName)
     {
