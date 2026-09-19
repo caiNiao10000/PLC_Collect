@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- 刻意不写 TargetFramework：由 Directory.Build.props 统一提供 net8.0-windows。
+       模板会把 net10.0 写进来，必须手工删除；漏删会被 PLCDH001 护栏拦下。
+       包版本与 tests\PlcDataHub.Core.Tests 对齐（模板默认写的是更高版本，
+       刻意改回，避免同一仓库里两个测试项目跑在不同版本的 xunit 栈上）。 -->
+  <PropertyGroup>
+    <RootNamespace>PlcDataHub.Protocols.Tests</RootNamespace>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <PackageReference Include="FluentAssertions" Version="6.12.1" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\PlcDataHub.Protocols\PlcDataHub.Protocols.csproj" />
+    <ProjectReference Include="..\..\src\PlcDataHub.Core\PlcDataHub.Core.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- 刻意不写 TargetFramework：由 Directory.Build.props 统一提供 net8.0-windows。
+       ⚠️ 不要用 `dotnet new classlib -f net8.0` 生成：本机 .NET 10 SDK 的模板只暴露
+          net10.0，传 net8.0 会以退出码 127 失败。正确做法是默认生成后手工删掉
+          模板写入的 <TargetFramework> 行（本文件即如此），并由 Directory.Build.targets
+          的 PLCDH001 护栏拦住任何漏删。 -->
+  <PropertyGroup>
+    <RootNamespace>PlcDataHub.Protocols</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <!--
+      必须排除 tests 子目录。SDK 风格项目默认编译目录树下的所有 .cs；若将来有人把
+      测试项目挪进本项目子目录，测试源码会被编进类库并报"未能找到类型或命名空间名
+      Xunit"，而错误指向类库本身，极难排查。本机已实测。与 PlcDataHub.Core 保持一致。
+    -->
+    <Compile Remove="tests\**" />
+    <None Remove="tests\**" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\PlcDataHub.Core\PlcDataHub.Core.csproj" />
+  </ItemGroup>
+</Project>
