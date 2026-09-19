@@ -1,0 +1,42 @@
+# 换行符与文本规范化策略。
+#
+# 为什么必须有这个文件：本机 core.autocrlf=true，而仓库此前没有 .gitattributes，
+# 因此 git 会在 checkout 时把工作区文件从 LF 改写成 CRLF，与 .editorconfig 的
+# end_of_line = lf 直接冲突 —— 这个破坏是静默的，直到某天 diff 里出现满屏
+# "^M" 或者脚本因 CRLF 执行失败才会被发现。
+#
+# 策略：所有文本文件在仓库内与工作区都统一 LF。这是 C# / .NET 项目的常规做法，
+# 也避免了不同机器 core.autocrlf 设置不同导致的差异。
+#
+# 二进制文件显式标记，防止 git 对其做任何换行转换。
+
+* text=auto eol=lf
+
+# ---- 明确按文本处理（需要 LF）----
+*.cs        text eol=lf
+*.csproj    text eol=lf
+*.props     text eol=lf
+*.targets   text eol=lf
+*.sln       text eol=lf
+*.json      text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.md        text eol=lf
+*.sql       text eol=lf
+*.ps1       text eol=lf
+*.config    text eol=lf
+
+# ---- 二进制：禁止任何转换 ----
+*.dll       binary
+*.exe       binary
+*.pdb       binary
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.ico       binary
+*.zip       binary
+*.7z        binary
+*.pdf       binary
+*.xlsx      binary
+*.snk       binary
