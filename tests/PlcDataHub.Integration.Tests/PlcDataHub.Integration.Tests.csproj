@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    刻意不写 TargetFramework：由 Directory.Build.props 统一提供 net8.0-windows。
+    模板会把 net10.0 写进来，必须手工删除；漏删会被 PLCDH001 护栏拦下。
+    包版本与 tests\PlcDataHub.Core.Tests / tests\PlcDataHub.Protocols.Tests 对齐
+    （模板默认写的是更高版本，刻意改回，避免同一仓库里三个测试项目跑在不同版本的 xunit 栈上）。
+  -->
+  <PropertyGroup>
+    <RootNamespace>PlcDataHub.Integration.Tests</RootNamespace>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <PackageReference Include="FluentAssertions" Version="6.12.1" />
+    <!--
+      SkippableFact：本项目的集成测试以环境变量 PLCDATAHUB_TEST_PG 为门槛，
+      未配置数据库的机器上必须"报告跳过"而不是"失败"。
+      xunit 2.x 的 [Fact] 没有运行时跳过能力（Skip 参数是编译期常量），故必须引入它。
+    -->
+    <PackageReference Include="Xunit.SkippableFact" Version="1.4.13" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\PlcDataHub.Storage\PlcDataHub.Storage.csproj" />
+    <ProjectReference Include="..\..\src\PlcDataHub.Core\PlcDataHub.Core.csproj" />
+    <ProjectReference Include="..\..\src\PlcDataHub.Protocols\PlcDataHub.Protocols.csproj" />
+  </ItemGroup>
+</Project>

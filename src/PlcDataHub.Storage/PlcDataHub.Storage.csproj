@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    刻意不写 TargetFramework：由 Directory.Build.props 统一提供 net8.0-windows。
+    模板会把 net10.0 写进来，必须手工删除；漏删会被 PLCDH001 护栏拦下。
+  -->
+  <PropertyGroup>
+    <RootNamespace>PlcDataHub.Storage</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\PlcDataHub.Core\PlcDataHub.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <!--
+      Npgsql 锁 8.0.9 而不是让 `dotnet add package` 解出最新的 10.0.3：
+      本项目只用到 NpgsqlConnection / NpgsqlCommand / NpgsqlDataReader 这几个基础类型，
+      而依赖版本必须与目标框架 net8.0-windows 同一档 —— 8.x 是 net8 对齐的 LTS 线。
+      与 tests\PlcDataHub.Protocols.Tests 把模板默认包版本刻意改回同一档是同一个政策：
+      避免同一仓库里两个项目跑在不同主版本的运行时栈上。
+    -->
+    <PackageReference Include="Npgsql" Version="8.0.9" />
+  </ItemGroup>
+</Project>
