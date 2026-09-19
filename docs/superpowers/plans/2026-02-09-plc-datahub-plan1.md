@@ -813,10 +813,22 @@ Expected: 编译失败，`ColumnNameGenerator` 未定义。
   </PropertyGroup>
   <ItemGroup>
     <!-- 首选拼音库。若此包还原失败，见 Step 3b 的降级方案。 -->
-    <PackageReference Include="ToolGood.Words.FirstPinyin" Version="3.0.1.3" />
+    <PackageReference Include="ToolGood.Words.Pinyin" Version="3.0.1.4" />
   </ItemGroup>
 </Project>
 ```
+
+> **⚠️ 包名已于 Task 3 实测后修正（原写 `ToolGood.Words.FirstPinyin` 3.0.1.3，是错的）。**
+>
+> 实测结论：`FirstPinyin` 是**拼音首字母**库，`GetFirstPinyin("温度")` 返回 `"WD"`，
+> **语义上产不出规格 3.5 节要求的 `wen_du`**；且它没有 `GetPinyin` 方法，原示例代码连编译都过不了。
+> 正确选择是同作者的**全拼**包 `ToolGood.Words.Pinyin`。
+>
+> 权威依据见 `docs/specs/2026-02-09-plc-datahub-design.md` §8.1「选型结论」与 §8.2 依赖清单
+> （含实测 API 形状：`GetPinyin(string text, string splitSpan, bool tone)`、tone 必填、
+> 返回首字母大写故须 `ToLowerInvariant`、`splitSpan` 是字符之间连接符故须整段转换、
+> 库对码表外汉字段内透传故须逐字符过滤 ASCII）。
+> **不要"照原样修正"回 FirstPinyin** —— 那会静默打破规格 3.5 节，且现有测试会失败。
 
 Run:
 ```powershell
@@ -955,9 +967,29 @@ public static class ColumnNameGenerator
 
     private static string ToPinyin(char ch)
     {
-        // ToolGood.Words.FirstPinyin 的 API：返回该字符的拼音（无声调，小写）
-        var pinyin = ToolGood.Words.WordsHelper.GetPinyin(ch.ToString());
-        return string.IsNullOrEmpty(pinyin) ? string.Empty : pinyin.ToLowerInvariant();
+        // 实测 API（ToolGood.Words.Pinyin 3.0.1.4）：
+        //   GetPinyin(string text, string splitSpan, bool tone) —— tone 必填，无单参重载；
+        //   tone:false → "Wen_Du"（无声调，首字母大写，故须 ToLowerInvariant）；
+        //   splitSpan 是"字符之间"的连接符，单字调用不含分隔符，故必须整段转换。
+        // ⚠️ 不要换成 ToolGood.Words.FirstPinyin：那是首字母库，返回 "WD" 而非 "wen_du"。
+        var pinyin = ToolGood.Words.Pinyin.WordsHelper.GetPinyin(chineseRun, "_", false);
+
+        if (string.IsNullOrEmpty(pinyin))
+        {
+            return string.Empty;
+        }
+
+        // 库对码表外的汉字是"段内逐个透传"（GetPinyin("温鿿") == "Wen_鿿"），
+        // 故不能靠"整段是否等于输入"判断转出成功 —— 那会漏掉部分转出的情形。
+        // 逐字符只保留 ASCII 字母数字，从根上保证列名是纯 ASCII。
+        var sb = new StringBuilder(pinyin.Length);
+
+        foreach (var ch in pinyin.ToLowerInvariant())
+        {
+            sb.Append(ch is >= 'a' and <= 'z' or >= '0' and <= '9' ? ch : '_');
+        }
+
+        return sb.ToString();
     }
 
     private static string CollapseUnderscores(string value)
