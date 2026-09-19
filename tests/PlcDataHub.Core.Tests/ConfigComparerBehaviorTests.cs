@@ -15,34 +15,34 @@ namespace PlcDataHub.Core.Tests;
 /// 本测试从行为上堵死这个盲区，两层互补：
 ///   结构层（反射）保证"属性被同步到比较器"，行为层（本测试）保证"比较真的生效"。
 ///
-/// 维护方式：新增属性时若本测试的映射表里没有对应默认值/不同值，会以
+/// 维护方式：新增属性时若本测试的映射表里没有对应不同值，会以
 /// 明确的失败信息提示补齐（见 Unhandled）。
 /// </summary>
 public class ConfigComparerBehaviorTests
 {
-    /// <summary>每个属性类型的默认值与"不同值"。新增属性时在此登记。</summary>
-    private static readonly Dictionary<string, (object Default, object Different)> ValueOverrides = new()
+    /// <summary>每个属性对应的"不同值"。新增属性时在此登记。</summary>
+    private static readonly Dictionary<string, object> DifferentValues = new()
     {
-        ["PointId"] = (1, 2),
-        ["PointCode"] = ("p1", "p2"),
-        ["PointName"] = ("温度", "压力"),
-        ["ColumnName"] = ("wen_du", "ya_li"),
-        ["DataType"] = (PointDataType.Real, PointDataType.Word),
-        ["ByteOrder"] = (ByteOrder.Big, ByteOrder.Little),
-        ["Scale"] = (1.0, 2.0),
-        ["Offset"] = (0.0, 5.0),
-        ["Enabled"] = (true, false),
-        ["S7"] = (new S7Address(S7Area.DataBlock, 1, 0, 0), new S7Address(S7Area.DataBlock, 1, 4, 0)),
-        ["Modbus"] = (
-            new ModbusAddress(1, ModbusRegisterArea.HoldingRegister, 100),
-            new ModbusAddress(1, ModbusRegisterArea.HoldingRegister, 200)),
-        ["GroupId"] = (1, 2),
-        ["ConnId"] = (1, 2),
-        ["GroupCode"] = ("fast", "slow"),
-        ["GroupName"] = ("快组", "慢组"),
-        ["PeriodMs"] = (1000, 5000),
-        ["TableName"] = ("plc01_fast", "plc01_slow"),
-        ["Points"] = ("default-points", "different-points"),
+        ["PointId"] = 2,
+        ["PointCode"] = "p2",
+        ["PointName"] = "压力",
+        ["ColumnName"] = "ya_li",
+        ["DataType"] = PointDataType.Word,
+        ["ByteOrder"] = ByteOrder.Little,
+        ["Scale"] = 2.0,
+        ["Offset"] = 5.0,
+        ["Enabled"] = false,
+        ["S7"] = new S7Address(S7Area.DataBlock, 1, 4, 0),
+        ["Modbus"] = new ModbusAddress(1, ModbusRegisterArea.HoldingRegister, 200),
+        ["GroupId"] = 2,
+        ["ConnId"] = 2,
+        ["GroupCode"] = "slow",
+        ["GroupName"] = "慢组",
+        ["PeriodMs"] = 5000,
+        ["TableName"] = "plc01_slow",
+        // Points 是集合：标量表达不了"不同值"，MutateGroup 里单独构造（换成一个不同的点列表）。
+        // 这里登记的不是值而是"已登记"这个事实 —— 缺了它，"新增属性必须登记"的失败通道对本属性失效。
+        ["Points"] = "(集合类型，见 MutateGroup)",
     };
 
     public static IEnumerable<object[]> PointConfigProperties() =>
@@ -108,7 +108,7 @@ public class ConfigComparerBehaviorTests
 
     private static PointConfig MutatePoint(PointConfig point, string propertyName)
     {
-        var (_, different) = ResolveOverride(propertyName);
+        var different = ResolveDifferentValue(propertyName);
         return propertyName switch
         {
             "PointId" => point with { PointId = (int)different },
@@ -128,7 +128,7 @@ public class ConfigComparerBehaviorTests
 
     private static PollGroup MutateGroup(PollGroup group, string propertyName)
     {
-        var (_, different) = ResolveOverride(propertyName);
+        var different = ResolveDifferentValue(propertyName);
         return propertyName switch
         {
             "GroupId" => group with { GroupId = (int)different },
@@ -143,14 +143,14 @@ public class ConfigComparerBehaviorTests
         };
     }
 
-    private static (object Default, object Different) ResolveOverride(string propertyName) =>
-        ValueOverrides.TryGetValue(propertyName, out var pair)
-            ? pair
-            : throw Unhandled(propertyName, "ValueOverrides");
+    private static object ResolveDifferentValue(string propertyName) =>
+        DifferentValues.TryGetValue(propertyName, out var value)
+            ? value
+            : throw Unhandled(propertyName, nameof(DifferentValues));
 
     private static Exception Unhandled(string propertyName, string where) =>
         new InvalidOperationException(
-            $"模型新增属性 {propertyName} 未在 {where} 中登记默认值与不同值。"
+            $"模型新增属性 {propertyName} 未在 {where} 中登记不同值。"
             + "请补上映射，否则该属性会失去行为级防护。");
 
     private static IEnumerable<string> MutatableProperties(Type type) =>
