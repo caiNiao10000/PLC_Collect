@@ -97,6 +97,22 @@ public class ConfigComparerTests
         rightNull.Should().Throw<ArgumentNullException>();
     }
 
+    [Fact]
+    public void 两个参数都为_null_时必须抛出_ArgumentNullException()
+    {
+        // 锁定"null 表示配置尚未加载、必须明确报错"的语义，对三个入口一并成立。
+        // 必须单独有这条：上面 6 条断言都只覆盖"恰好一侧为 null"，
+        // 把 ThrowIfNull 移到 ReferenceEquals 之后时它们仍会全绿 ——
+        // 而 (null, null) 会被 ReferenceEquals 短路成 true（正是"静默跳过重建"最直白的情形）。
+        Action pointBothNull = () => ConfigComparer.PointEquivalent(null!, null!);
+        Action groupBothNull = () => ConfigComparer.GroupsEquivalent(null!, null!);
+        Action pointsBothNull = () => ConfigComparer.PointsEquivalent(null!, null!);
+
+        pointBothNull.Should().Throw<ArgumentNullException>();
+        groupBothNull.Should().Throw<ArgumentNullException>();
+        pointsBothNull.Should().Throw<ArgumentNullException>();
+    }
+
     private static IReadOnlyList<PointConfig> MakePoints(int count) =>
         Enumerable.Range(1, count).Select(id => MakePoint(id, "温度")).ToList();
 
