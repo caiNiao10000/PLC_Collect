@@ -24,7 +24,13 @@
 - **采集点数据列不设主键、不设唯一约束**，只建 `ts` 索引（规格 3.4）。
 - **迁移必须幂等**：同一份配置连续执行两次，第二次不产生任何 DDL（规格 4.3，验收项 A12）。
 - **绝不静默丢数据**：删点默认软删除、类型冲突硬拦截、迁移单事务执行（规格 4.2）。
-- **编码统一 UTF-8**，C# 文件用 `\n` 换行，文件末尾留空行。
+- **编码统一 UTF-8**，C# 文件用 `\n` 换行，文件末尾留空行。仓库已有 `.gitattributes`（`* text=auto eol=lf`）强制 LF，不要改它。
+- **⚠️ 用 PowerShell 改写含中文的源文件时必须显式指定 UTF-8，并做字节级校验。**
+  Task 1 实测踩坑：`Get-Content -Raw` + `Set-Content`（未指定 `-Encoding`）在 PowerShell 5.1 下按**系统 ANSI 代码页（CP936/GBK）**写出，把 `Directory.Build.props` 里的 7 个中文字符写成了非法 UTF-8（`覆盖` 的 `覆` → `E7 9B 3F`、`。` → 半角 `?`），且**没有任何报错**。
+  正确做法：用 `[System.IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding($false)))`；
+  写完必须复验「字节数 + 无 U+FFFD + 纯 LF + 末尾换行 + 关键中文串命中」。
+  **注意：控制台显示中文乱码往往只是代码页渲染问题，不代表文件损坏——判断文件是否损坏必须看字节，不能靠肉眼比对终端输出。**
+  更稳妥的做法是优先用文件写入工具而非 shell 改写源码。
 - **PowerShell 脚本必须兼容 PowerShell 5.1**，禁止 7.x 专有语法（规格 1.5）。
 - 所有提交信息用中文，格式 `feat:` / `test:` / `fix:` / `chore:` / `docs:`。
 
@@ -230,9 +236,25 @@ public static class TargetFrameworkProbe
 
 > 版本说明：`FluentAssertions` **必须用 6.x**——8.0 起改为商业许可，7.x 起许可证变更，6.12.1 是最后的宽松许可版本。`xunit` 用 2.x 而非 3.x，因为 3.x 的 runner 生态在 .NET 8 上仍有兼容问题。
 
-- [ ] **Step 5: 写失败测试**
+- [ ] **Step 5: 写测试**
 
 路径：`tests/PlcDataHub.Core.Tests/TargetFrameworkTests.cs`
+（内容见 Step 5b 的最终版本；先只写 `目标框架必须是_net8_0` 一条 Fact 即可）
+
+> **⚠️ 这条测试不会"先红后绿"，这是正常的，不要为了凑红色去故意写错配置。**
+> Task 1 实测确认：断言对象是**编译时 TFM 决定**的属性，而 Step 2 的 `Directory.Build.props`
+> 已经写对了框架，所以只要项目能编译，这条断言必然为真。它测试的是"构建配置的结果"，
+> 不是"待实现的业务逻辑"，因此不存在"实现缺失导致失败"的阶段。
+> 它的价值是**回归防护**——拦住未来的误升级。
+>
+> **要证明这条断言真的有拦截力，用变异测试**（Task 1 已实测有效）：
+> 临时把 `Directory.Build.props` 的 `TargetFramework` 改成 `net10.0-windows`，
+> 跑 `dotnet test`，应看到 `失败: 1`（断言报 `Expected .NETCoreApp,Version=v8.0 but found v10.0`），
+> 然后**在 `finally` 中还原并逐字节校验**（字节数、无 U+FFFD、纯 LF、末尾换行）。
+>
+> 注意：**不要用 `dotnet test -p:TargetFramework=net10.0-windows` 做这个变异**——
+> Task 1 实测它会让 `project.assets.json` 与 TFM 不一致，报 `error NETSDK1005`
+> 在**构建阶段**就失败，证明不了断言有效。必须真改构建配置文件。
 
 ```csharp
 using FluentAssertions;
