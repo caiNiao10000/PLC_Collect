@@ -2,7 +2,7 @@
 
 - 日期：2026-02-09
 - 状态：五节设计已与用户逐节确认，待用户审规格，审后进入实施计划
-- 工程目录：`D:\deepseek\plc-datahub`
+- 工程目录：`D:\deepseek\PLC_Collect`
 - 交付形态：两个可执行程序 + PostgreSQL + 本地兜底文件
 
 ---
@@ -64,7 +64,16 @@
 
 **自包含发布（Self-contained publish）**：两个程序均以 `--self-contained -r win-x64` 发布，**不要求现场机预装 .NET 运行时**。理由：工业现场常是内网离线环境，让运维去装运行时（还可能装错版本）比让发布包大 70 MB 代价高得多。
 
-**版本控制**：`D:\deepseek\plc-datahub` 初始化 git 仓库，代码、规格文档、实施计划、部署脚本全部纳入版本控制（用户确认）。
+**版本控制与远端**（用户确认）：
+
+| 项 | 值 |
+|---|---|
+| 本地仓库根 | `D:\deepseek\PLC_Collect` |
+| 远端仓库 | `https://github.com/caiNiao10000/PLC_Collect.git`（`origin`） |
+| 命名约定 | **目录与远端仓库名为 `PLC_Collect`；C# 命名空间保持 `PlcDataHub`**。理由：C# 命名空间带下划线不符合 .NET 命名规范（对比官方的 `System.Net` 而非 `System_Net`），而仓库名要跟用户已有仓库一致 |
+| 同步策略 | **本地为主，定期推送**到 `PLC_Collect`（用户确认）。每次完成一个任务即提交，阶段完成即推送 |
+| 初始状态 | 推送时远端为空仓库（已实测确认无任何提交），因此不存在合并冲突，可直接建立 `main` 分支 |
+| 认证 | 远端为私有仓库，推送需用户凭据。**本机无存储凭据**（`~/.git-credentials` 不存在），推送时由用户完成认证或提供临时凭据 |
 
 **Windows 10 / 11 差异清单（实施时必须逐项验证）**
 
@@ -521,7 +530,7 @@ S7 与 Modbus RTU 的帧都不带请求 ID，多线程共用一个 socket/串口
 ## 8. 工程结构
 
 ```
-D:\deepseek\plc-datahub\
+D:\deepseek\PLC_Collect\
 ├─ PlcDataHub.sln
 ├─ src\
 │  ├─ PlcDataHub.Core\            领域模型、配置 DTO、列名生成、迁移差异引擎、降采样算法（无外部依赖，可纯单元测试）
