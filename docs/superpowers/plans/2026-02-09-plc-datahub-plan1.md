@@ -32,6 +32,13 @@
   **注意：控制台显示中文乱码往往只是代码页渲染问题，不代表文件损坏——判断文件是否损坏必须看字节，不能靠肉眼比对终端输出。**
   更稳妥的做法是优先用文件写入工具而非 shell 改写源码。
 - **PowerShell 脚本必须兼容 PowerShell 5.1**，禁止 7.x 专有语法（规格 1.5）。
+- **禁止 `git add -A` / `git add .`，一律显式列出本任务改动的路径。**
+  原因：本计划的任务可能由并行 subagent 执行、共享同一个工作树；后提交者会把 HEAD 推移而先开工者不知情。
+  若使用 `git add -A`，会把他人未提交的改动裹进自己的提交，且**提交信息会完全误导后来的人**。
+  （此风险实际发生过一次：Task 2 的文档修复把 HEAD 从 `bda6a5d` 推到 `818de1e`，而并行的代码修复基线记的是 `bda6a5d`。）
+- **变异/探针实验收尾必须清理自己制造的残留**（含 `bin`/`obj` 下的异常目录、`Release`/`publish` 产物、临时探针文件），并复验工作树干净。
+- **凡是要枚举类型成员，一律用反射，不要用正则或手工清单。**
+  实测教训：控制者曾用正则抽取模型属性得到 18 个，反射实测为 19 个（正则的行尾锚点在每个 record 的最后一个参数上失配，且手工清单里重复写了一项，两个错误凑巧抵消成一个"看起来合理"的数字）。
 - 所有提交信息用中文，格式 `feat:` / `test:` / `fix:` / `chore:` / `docs:`。
 
 ---
@@ -389,7 +396,7 @@ trim_trailing_whitespace = false
 
 Run:
 ```powershell
-git add -A
+git add <本任务改动的显式路径>
 git commit -m "chore: 工程骨架与目标框架锁定 net8.0-windows
 
 - Directory.Build.props 统一锁定框架，防止误升级到 net9/net10
@@ -675,7 +682,7 @@ Expected: `Passed! - Failed: 0, Passed: 4`（含 Task 1 的 2 条框架断言：
 - [ ] **Step 5: 提交**
 
 ```powershell
-git add -A
+git add <本任务改动的显式路径>
 git commit -m "feat: 领域模型（连接/采集组/采集点/协议枚举）"
 ```
 
@@ -726,7 +733,6 @@ public class ColumnNameGeneratorTests
     public void 结果必须以字母或下划线开头()
     {
         ColumnNameGenerator.Normalize("123abc").Should().StartWith("p");
-        ColumnNameGenerator.Normalize("___").Should().NotStartWith("_");
     }
 
     [Fact]
@@ -787,6 +793,17 @@ Expected: 编译失败，`ColumnNameGenerator` 未定义。
 
 - [ ] **Step 3: 加拼音包引用并验证可用**
 
+> **⚠️ 控制者扫描发现的两点，必须按序执行：**
+>
+> **① 拼音库的 API 是未知量，必须实测，不许照抄。** 下面的实现代码里写的是
+> `ToolGood.Words.WordsHelper.GetPinyin(string)` —— 这是**未经核实的猜测**（规格 8.1 节已把拼音库列为待验证依赖）。
+> 本步骤的正确顺序是：**先加包 → 写一个最小调用样例跑通 → 按实际 API 调整实现**，
+> 而不是先照抄实现再去调测试预期。
+>
+> **② 本步骤应在写测试之前完成。** if 包还原失败，会走降级链，而**降级链要求改写
+> `ColumnNameGeneratorTests` 中带拼音的两条 `InlineData`**。若先写了测试再发现要降级，
+> 会白改一轮。故顺序为：Step 3（验证依赖）→ Step 1（写测试）→ Step 2（确认 RED）→ Step 4（实现）。
+
 修改 `src/PlcDataHub.Core/PlcDataHub.Core.csproj`：
 
 ```xml
@@ -807,13 +824,28 @@ dotnet restore src\PlcDataHub.Core
 ```
 Expected: `Restored`。若报找不到包或目标框架不兼容，执行 **Step 3b**。
 
+**然后写一个最小样例实测 API 形状**（例如在测试项目里临时加一条调用，或用 `dotnet run` 的临时控制台，
+用 `csc` 不可行时的替代做法写在报告里），确认：
+- 方法名与重载（`WordsHelper.GetPinyin` 是否存在？参数是 `string` 还是 `char`？有无 `separator` 参数？）
+- 返回是否**无声调**（`wēn dù` 带声调会导致 `温度 → wēn_dù` 而不是 `wen_du`）
+- 多音字与单个汉字的行为
+
+**把实测结果写进报告**，并按实际 API 调整 Step 4 的实现与 Step 1 的测试预期。
+
 - [ ] **Step 3b: 拼音库降级（仅当 Step 3 失败时执行）**
 
 按规格 8.1 节的降级链，把 csproj 里的包引用整段删除（不引入任何拼音库），
 并让 `ColumnNameGenerator` 走"无拼音库"分支：中文字符整体丢弃，
-若结果为 `p{pointId}` 形式则由调用方补位。此时必须**在 `ColumnNameGeneratorTests` 中把**
-`温度 → wen_du`、`1#窑尾温度 → p1_yao_wei_wen_du` 两个用例标记为 `[Fact(Skip = "拼音库不可用，走降级链")]`，
-其余用例保持通过。**这一步的目的是保证依赖不可用时项目仍能继续推进，而不是卡住。**
+若结果为 `p{pointId}` 形式则由调用方补位。
+
+此时必须**在 `ColumnNameGeneratorTests` 中移除**带中文的两条 `InlineData`
+（`("温度", "wen_du")` 与 `("1#窑尾温度", "p1_yao_wei_wen_du")`），
+并用 `[Fact(Skip = "拼音库不可用，走降级链")]` 单独记录这两条预期，其余用例保持通过。
+
+> **注意**：不能直接给 `[Theory]` 加 `Skip` —— 那会跳过整个 Theory（含 4 条 InlineData 中
+> 与中文无关的 `Temp Kiln`、`PID_输出%`）。原 brief 此处写法有误，已修正为"移除这两条 InlineData"。
+
+**这一步的目的是保证依赖不可用时项目仍能继续推进，而不是卡住。**
 
 - [ ] **Step 4: 写实现**
 
@@ -1013,7 +1045,7 @@ Expected: `Passed!`。特别注意 `PID_输出% → pid_shu_chu` 这一条——
 - [ ] **Step 6: 提交**
 
 ```powershell
-git add -A
+git add <本任务改动的显式路径>
 git commit -m "feat: 列名生成器（中文转拼音、ASCII 规范化、冲突避让、63 字节截断）"
 ```
 
@@ -1363,7 +1395,7 @@ Expected: `Passed!`
 - [ ] **Step 5: 提交**
 
 ```powershell
-git add -A
+git add <本任务改动的显式路径>
 git commit -m "feat: SQL 类型映射与期望结构构建（配置图 → 目标表结构）"
 ```
 
@@ -1935,7 +1967,7 @@ Expected: `Passed!`，无失败。
 - [ ] **Step 7: 提交**
 
 ```powershell
-git add -A
+git add <本任务改动的显式路径>
 git commit -m "feat: 迁移差异引擎（建表/加列/软删除/类型冲突拦截/幂等）
 
 - 删点默认软删除为 deleted_* 保留数据
@@ -2493,7 +2525,7 @@ Expected: `Passed!`。重点确认 `合并块中的空洞位置不会导致相�
 - [ ] **Step 6: 提交**
 
 ```powershell
-git add -A
+git add <本任务改动的显式路径>
 git commit -m "feat: 读块合并与字节解码
 
 - ReadBlockPlanner 按窗口合并连续地址，超出单请求上限自动切块
@@ -2928,7 +2960,7 @@ Expected: `Passed!`
 - [ ] **Step 6: 提交**
 
 ```powershell
-git add -A
+git add <本任务改动的显式路径>
 git commit -m "feat: Modbus TCP 连接与可编程假连接
 
 - ModbusTcpConnection 按寄存器区分别规划读块，读块级故障隔离
@@ -3268,7 +3300,7 @@ Expected: 未设环境变量时报告 skipped、无失败；设了环境变量�
 - [ ] **Step 6: 提交**
 
 ```powershell
-git add -A
+git add <本任务改动的显式路径>
 git commit -m "feat: PostgreSQL 连接工厂与数据表结构内省
 
 - SchemaIntrospector 读 information_schema 得到现存列与行数
