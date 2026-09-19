@@ -2626,6 +2626,24 @@ git commit -m "feat: 读块合并与字节解码
 
 ## Task 7：Modbus TCP 协议实现与假连接
 
+### Task 7 必须满足的跨任务约束（由 Task 6 的实际产出推导，非可选）
+
+1. **`ReadAsync` 必须按 `(SlaveId, ModbusRegisterArea)` 分组，每组分别调用 `PlanForModbus`。**
+   理由（Task 6 实现者提出 + 控制者补充）：`PlanForModbus` **不校验寄存器区、不按 `SlaveId` 分组**，会把线圈/离散输入/保持寄存器/输入寄存器的点、以及不同从站的点**合并进同一个块** → 发出跨功能码、跨从站的请求。
+   这**不只是"可能被设备拒绝"，而是真实的错误**：**寄存器区之间的地址编号不通用**（保持寄存器 100 与输入寄存器 100 是完全不同的寄存器），跨从站同理。
+   **规划器签名保持不变**——分组是连接层编排，不是规划器职责。
+
+2. **Modbus 侧字节偏移必须乘 2：`byteOffset = (点寄存器地址 - block.StartAddress) * 2`。**
+   `ReadBlock.StartAddress` 对 Modbus 是**寄存器地址**，对 S7 是**字节偏移**——弄混不会抛异常，只会**静默读错字节**。（Task 6 已把该双重语义写进 XML 注释。）
+
+3. **`ByteDecoder` 对 `Bool` / `Dtl` / `String` 抛 `NotSupportedException`，不要试图在连接层绕过。**
+   `Bool` 必须走 `DecodeBool(buffer, byteOffset, bitOffset)`；`Dtl` 与 `String` 本期不支持。
+
+### 已知模型限制（不得在本任务"顺手绕过"，需保持现状）
+
+- **小端语义 = 整值字节逆序，不是 word-swapped。** 真实 Modbus 设备有四种字节序（ABCD / DCBA / BADC / CDAB），而 `ByteOrder` 只有 `Big`/`Little`，**无法表达 word-swapped（BADC / CDAB）**。若现场遇到此类设备，需扩模型而非在连接层做特例。
+- **`String` 无长度来源**：`PointConfig` 没有字符串长度字段，`ByteWidth`/`RegisterWidth` 对 `String` 都给占位值 1。**"Modbus 字符串"在 Plan 1 数据模型里无法表达。**
+
 **Files:**
 - Create: `src/PlcDataHub.Protocols/Modbus/ModbusTcpConnection.cs`
 - Create: `src/PlcDataHub.Protocols/Fake/FakePlcConnection.cs`
