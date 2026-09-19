@@ -1,0 +1,32 @@
+# ===== 构建产物 =====
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+*.user
+*.suo
+.vs/
+publish/
+artifacts/
+
+# ===== 运行时数据（绝不入库）=====
+# 数据库连接参数（含加密后的密码）
+config/appsettings.json
+# 配置快照
+config/config.snapshot.json
+# 断库缓冲文件
+buffer/
+# 日志
+logs/
+*.log
+
+# ===== 测试与工具 =====
+TestResults/
+*.trx
+*.coverage
+.vscode/
+.idea/
+
+# ===== 操作系统 =====
+Thumbs.db
+desktop.ini
