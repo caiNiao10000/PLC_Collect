@@ -567,7 +567,7 @@ D:\deepseek\PLC_Collect\
 | 依赖 | 风险 | 对策 |
 |---|---|---|
 | **NModbus** | 主流版本的历史目标框架为 .NET Standard 2.0 / .NET Framework 代际，在 .NET 8 上的**串口（RTU）路径**需要实测。历史上有 `NModbus4` 分支，但已停止维护，不作为候选 | 第一步写最小样例实测 TCP 与 RTU 两条通道；若 RTU 在 .NET 8 上不可用，退路是自己实现 Modbus RTU 帧层（协议简单，仅 CRC + 功能码 01/02/03/04，工作量可控）——**这也是把 `PlcDataHub.Protocols` 独立成项目的原因** |
-| **拼音库** | `TinyPinyin`、`NPinyin` 等包活跃度低，目标框架可能停留在 .NET Framework。若引入失败，**不能因此阻塞** | 首选现代活跃的 `ToolGood.Words.FirstPinyin`；若全部不可用，降级方案是**只做 ASCII 规范化 + 中文列名由用户手工填写或自动用 `point_code`**（见下） |
+| **拼音库** | `TinyPinyin`、`NPinyin` 等包活跃度低，目标框架可能停留在 .NET Framework。若引入失败，**不能因此阻塞** | 已实测选定 **`ToolGood.Words.Pinyin`**（`ToolGood.Words.FirstPinyin` 已排除，原因见下方"选型结论"）；若全部不可用，降级方案是**只做 ASCII 规范化 + 中文列名由用户手工填写或自动用 `point_code`**（见下） |
 | **S7.Net** | 工作区已有源码 `D:\deepseek\s7netplus-src\s7netplus-main`，可直接引用或按需修补 | 编译该源码作为本地项目引用，避免包版本不可控；同时便于针对 S7-200 SMART 打补丁 |
 
 **列名生成的降级链**（保证任何情况下都有确定结果，且不阻塞开工）：
@@ -578,6 +578,40 @@ D:\deepseek\PLC_Collect\
 4. 拼音库不可用                     → 用 col_{point_id}，并在界面提示用户手工改名
 ```
 第 4 条保证**即使一个拼音库都装不上，软件依然能建表和采集**，只是列名不好看。这比"卡在依赖上"可接受得多。
+
+**拼音库选型结论（Task 3 本机实测，权威记录；后续任务照此执行）**
+
+选定 **`ToolGood.Words.Pinyin` 3.0.1.4**，**排除 `ToolGood.Words.FirstPinyin`**。
+
+> ⚠️ 本条推翻了本节早先"首选 `ToolGood.Words.FirstPinyin`"的写法。原因是该包**语义上产不出规格 3.5 节要求的全拼**：
+> 它是**拼音首字母**库，实测 `GetFirstPinyin("温度")` 返回 **`"WD"`**（且返回大写），
+> `GetFirstPinyin("1#窑尾温度")` 返回 `"1#YWWD"`，而规格 3.5 节要求 `温度 → wen_du`。
+> 该包甚至**不存在 `GetPinyin` 方法**，命名空间也非 `ToolGood.Words`（实为 `ToolGood.Words.FirstPinyin`），
+> 故照旧写法调用连编译都通不过。两个包同作者、同系列，后者专做全拼。
+
+实测 API 形状（**tone 为必填参数，无单参重载**）：
+
+```csharp
+ToolGood.Words.Pinyin.WordsHelper.GetPinyin(string text, string splitSpan, bool tone)
+```
+
+- `tone: false` → **无声调**：`GetPinyin("温度", "_", false) == "Wen_Du"`
+- `tone: true`  → **带声调**：`GetPinyin("温度", "_", true)  == "Wēn_Dù"`（**不可用**，会让列名变成 `wēn_dù`）
+- **返回首字母大写**（`"Wen"`），故调用方**必须** `ToLowerInvariant()`
+- **`splitSpan` 是"字符之间"的连接符，不是尾随/前导分隔符**：
+  `GetPinyin("温", "_", false) == "Wen"`（单字调用**不含**分隔符）。
+  因此**连续汉字必须整段交给库**；若逐字符调用再自行拼接，会得到 `"wendu"` 而非 `"wen_du"`。
+- **多音字取首项、不做词级消歧**：`GetAllPinyin('重', false) == [Zhong, Chong]`，库取 `Zhong`，
+  故"重庆"会得到 `zhong_qing`。列名仍**稳定且唯一**，不影响 DDL 正确性。
+- 支持范围自述 `[0x3400,0x4DB5] [0x4E00,0x9FA5]`，实测可超出。
+- **码表外的汉字是"段内逐个透传"，不是整段失败**：`GetPinyin("温鿖", "_", false) == "Wen_鿖"`。
+  故调用方**必须对库输出逐字符过滤、只保留 ASCII**，
+  **不能**用"整段输出是否等于输入"来判断转出是否成功 —— 那会漏掉部分透传，让非 ASCII 混进列名，
+  违反规格 3.5 节"列名统一 ASCII"。（U+9FD6..U+9FFF 共 42 个码点属此形态。）
+- 包目标框架 `netstandard2.0/2.1` + `net40`，与 `net8.0-windows` 兼容，已实测还原与运行正常。
+
+对应实现与回归测试：`src/PlcDataHub.Core/Naming/ColumnNameGenerator.cs`、
+`tests/PlcDataHub.Core.Tests/ColumnNameGeneratorTests.cs`（含"码表外汉字透传时结果仍为纯 ASCII"用例）。
 
 ### 8.2 最小依赖清单
 
@@ -590,7 +624,7 @@ D:\deepseek\PLC_Collect\
 | 串口 | `System.IO.Ports` |
 | 日志 | `Serilog` + `Serilog.Sinks.File`（按大小滚动，保留 N 天） |
 | 前台图表 | ECharts（通过 JS 互操作嵌入 Blazor） |
-| 拼音 | `ToolGood.Words.FirstPinyin`（首选，活跃度高）；备选 `TinyPinyin`；均不可用时走 8.1 节降级链 |
+| 拼音 | `ToolGood.Words.Pinyin` 3.0.1.4（**已实测选定**，API 形状见 8.1 节）；~~`ToolGood.Words.FirstPinyin`~~（已排除：是首字母库，产不出全拼）；均不可用时走 8.1 节降级链 |
 | 测试 | xUnit + FluentAssertions |
 
 ---

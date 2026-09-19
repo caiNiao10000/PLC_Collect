@@ -14,7 +14,13 @@ public static class ColumnNameGenerator
     /// <summary>PostgreSQL 标识符的硬上限，单位是字节。</summary>
     public const int MaxIdentifierBytes = 63;
 
-    /// <summary>截断时为哈希后缀预留的字符数（下划线 + 8 位十六进制）。</summary>
+    /// <summary>
+    /// 截断时为哈希后缀预留的**字节数**（下划线 + 8 位十六进制）。
+    /// 之所以"字符数"与"字节数"在此等价、可直接参与字节预算计算：
+    /// 后缀恒为 <c>"_" + 8 位十六进制</c>，全部是 ASCII，1 字符 = 1 字节。
+    /// 若将来改用非 ASCII 的哈希编码（如 Base64 含 <c>+/=</c> 仍是 ASCII，但若引入其他字符集则不然），
+    /// 必须重新核算本常量的字节数，否则会静默突破 63 字节上限。
+    /// </summary>
     private const int HashSuffixLength = 9;
 
     /// <summary>
@@ -115,12 +121,12 @@ public static class ColumnNameGenerator
     private static bool IsChinese(char ch) => ch is >= '\u4e00' and <= '\u9fff';
 
     /// <summary>
-    /// 一段连续汉字转无声调全拼，返回小写。
+    /// 一段连续汉字转无声调全拼，返回**纯 ASCII** 小写串（音节以 <c>_</c> 分隔）。
     /// 实测库行为（ToolGood.Words.Pinyin 3.0.1.4）：
     ///   GetPinyin("温度", "_", false) == "Wen_Du" —— 返回首字母大写，故此处统一 ToLowerInvariant；
     ///   splitSpan 是"字符之间"的连接符，单字调用不含分隔符；
     ///   tone:true 会得到带声调的 "Wēn_Dù"，故必须传 false。
-    /// 输出统一改写为下划线分隔，不依赖库的分隔符取何种字符。
+    /// 返回串直接沿用库给的 <c>_</c> 分隔，本方法不对分隔符做任何改写。
     /// </summary>
     private static string ToPinyin(string chineseRun)
     {
@@ -131,13 +137,19 @@ public static class ColumnNameGenerator
             return string.Empty;
         }
 
-        pinyin = pinyin.ToLowerInvariant();
+        // 库对码表外的汉字（如 U+9FD6..U+9FFF）是"段内逐个透传"，而不是整段失败：
+        //   GetPinyin("温鿖") == "Wen_鿖" —— 部分转出、部分原样带出。
+        // 因此【不能】用"整段是否等于输入"来判断转出是否成功，那会漏掉部分透传的情形，
+        // 让非 ASCII 直接混进列名（违反规格 3.5 节"列名统一 ASCII"）。
+        // 改为对库输出【逐字符】只保留 ASCII 字母数字，其余一律折为下划线，从根上保证纯 ASCII。
+        var sb = new StringBuilder(pinyin.Length);
 
-        // 库已按 splitSpan='_' 连接，此处无需再改写分隔符；
-        // 但若库对个别字符原样返回（超出其码表范围），结果会混入非 ASCII，故显式兜底。
-        return string.Equals(pinyin, chineseRun, StringComparison.Ordinal)
-            ? string.Empty
-            : pinyin;
+        foreach (var ch in pinyin.ToLowerInvariant())
+        {
+            sb.Append(ch is >= 'a' and <= 'z' or >= '0' and <= '9' ? ch : '_');
+        }
+
+        return sb.ToString();
     }
 
     private static string CollapseUnderscores(string value)
@@ -183,7 +195,10 @@ public static class ColumnNameGenerator
         var keepBytes = budget - HashSuffixLength;
         var prefix = keepBytes > 0 ? TruncateToBytes(value, keepBytes) : string.Empty;
 
-        return prefix + "_" + hash;
+        // TrimEnd('_')：截断点可能正好落在一个下划线之后（如 "a"*53 + "_" + "b"*100），
+        // 此时拼接 "_" + hash 会产出连续两个下划线、且违反"下划线不连续"的既有约定。
+        // 注：TrimEnd 只会减少字节数，故仍满足 <= MaxIdentifierBytes。
+        return prefix.TrimEnd('_') + "_" + hash;
     }
 
     private static string TruncateToBytes(string value, int maxBytes)

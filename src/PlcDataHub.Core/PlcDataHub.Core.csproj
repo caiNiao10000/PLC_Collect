@@ -18,10 +18,16 @@
       汉字转拼音（全拼）。规格 3.5 节要求中文列名转全拼，故必须用 Pinyin 包。
       ⚠️ 不要换成 ToolGood.Words.FirstPinyin：那个包是"拼音首字母"库，
          GetFirstPinyin("温度") 返回 "WD" 而非 "wen_du"，无法满足规格 3.5 节。
-         本机已实测确认（见 task-3-report.md 的拼音库实测小节）。
+      选型依据与实测 API 形状见权威文档：
+         docs/specs/2026-02-09-plc-datahub-design.md  §8.1（依赖风险与选型复核）
+         与 §8.2（最小依赖清单）
       实测 API（3.0.1.4）：ToolGood.Words.Pinyin.WordsHelper.GetPinyin(string text, string splitSpan, bool tone)
-         tone:false → 无声调，如 "Wen"；tone:true → 带声调，如 "Wēn"。
+         tone:false → 无声调，如 "Wen"；tone:true → 带声调，如 "Wēn"。tone 为必填参数，无单参重载。
          返回首字母大写，故调用方须 ToLowerInvariant。
+         splitSpan 是"字符之间"的连接符，单字调用不含分隔符（GetPinyin("温") == "Wen"），
+         故连续汉字必须整段转换，逐字拼接会得到 "wendu"。
+         ⚠️ 库对码表外的汉字是"段内逐个透传"（GetPinyin("温鿖") == "Wen_鿖"），
+         故调用方必须对库输出逐字符只保留 ASCII，不能用"整段是否等于输入"来判断转出是否成功。
     -->
     <PackageReference Include="ToolGood.Words.Pinyin" Version="3.0.1.4" />
   </ItemGroup>
