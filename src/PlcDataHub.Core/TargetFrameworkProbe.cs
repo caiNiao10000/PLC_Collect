@@ -12,7 +12,10 @@ public static class TargetFrameworkProbe
 
     /// <summary>编译时支持的最低操作系统平台，net8.0-windows 下实测为 "Windows7.0"。</summary>
     public static string SupportedPlatform => ReadAttribute<System.Runtime.Versioning.SupportedOSPlatformAttribute>()?
-        .PlatformName ?? throw new InvalidOperationException("找不到 SupportedOSPlatformAttribute");
+        .PlatformName ?? throw new InvalidOperationException(
+            "找不到 SupportedOSPlatformAttribute —— 当前程序集不是 net8.0-windows 目标。" +
+            "请检查 Directory.Build.props 的 TargetFramework 是否为 net8.0-windows，" +
+            "以及本项目的 csproj 是否私自覆盖了 TargetFramework。");
 
     private static T? ReadAttribute<T>() where T : Attribute =>
         (T?)Attribute.GetCustomAttribute(typeof(TargetFrameworkProbe).Assembly, typeof(T));

@@ -1,0 +1,19 @@
+<Project>
+  <!--
+    全局目标框架断言。Directory.Build.props 只提供默认值，而项目自身的 csproj
+    里的 <TargetFramework> 会覆盖它 —— 于是任何新项目（dotnet new 模板默认就会
+    写出显式 TargetFramework）在自身 csproj 里钉死 net10 都能绕过探针测试。
+    本文件在属性求值完成后执行，对所有项目生效，从机制上堵住这个逃逸。
+  -->
+  <Target Name="EnforcePlcDataHubTargetFramework" BeforeTargets="Build"
+          Condition="'$(TargetFramework)' != '' and '$(TargetFramework)' != 'net8.0-windows'">
+    <Error Code="PLCDH001"
+           Text="目标框架违规：项目 $(MSBuildProjectFile) 的 TargetFramework 为 '$(TargetFramework)'，但本项目必须为 net8.0-windows。原因：.NET 9/10 已放弃 Windows 10 支持，现场工控机大量为 Windows 10，升级会导致无法运行。请删除该 csproj 里的 &lt;TargetFramework&gt; 行，由 Directory.Build.props 统一提供。" />
+  </Target>
+
+  <Target Name="EnforcePlcDataHubTargetFrameworks" BeforeTargets="Build"
+          Condition="'$(TargetFrameworks)' != ''">
+    <Error Code="PLCDH002"
+           Text="目标框架违规：项目 $(MSBuildProjectFile) 使用了多目标 '$(TargetFrameworks)'。本项目只允许单一目标 net8.0-windows。" />
+  </Target>
+</Project>
