@@ -5,10 +5,28 @@
     写出显式 TargetFramework）在自身 csproj 里钉死 net10 都能绕过探针测试。
     本文件在属性求值完成后执行，对所有项目生效，从机制上堵住这个逃逸。
   -->
-  <Target Name="EnforcePlcDataHubTargetFramework" BeforeTargets="Build"
-          Condition="'$(TargetFramework)' != '' and '$(TargetFramework)' != 'net8.0-windows'">
+  <!--
+    挂钩点说明：挂在 PrepareForBuild 而不是 Build 上。
+    BeforeTargets="Build" 实测晚于 CoreCompile —— 编译器会先跑，于是：
+      (a) 逃逸产物（bin/obj 下的 net10 / win-x86 目录）已经落盘；
+      (b) RID 被改成 win-x86 时，编译器会先报一个语焉不详的
+          "CSC : error CS8012: 引用程序集...面向的是另一个处理器"，
+          而本护栏的明确错误（PLCDH001）根本轮不到报出。
+    PrepareForBuild 是 Build 链上 CoreCompile 之前的早期目标，挂在这里可以
+    在编译发生前就拦下，两个问题一并解决。
+  -->
+  <Target Name="EnforcePlcDataHubTargetFramework" BeforeTargets="PrepareForBuild;Build"
+          Condition="('$(TargetFramework)' != '' and '$(TargetFramework)' != 'net8.0-windows')
+                     or ('$(RuntimeIdentifier)' != '' and '$(RuntimeIdentifier)' != 'win-x64')">
+    <!-- 兜底清理：若上一次构建已在 bin/obj 留下逃逸产物，报错前一并清掉。
+         net10 产物位于 bin\$(Configuration)\$(TargetFramework)，
+         RID 变更的产物位于 ...\$(TargetFramework)\$(RuntimeIdentifier)。 -->
+    <RemoveDir Directories="$(MSBuildProjectDirectory)\bin\$(Configuration)\$(TargetFramework)" />
+    <RemoveDir Directories="$(MSBuildProjectDirectory)\obj\$(Configuration)\$(TargetFramework)" />
+    <RemoveDir Directories="$(MSBuildProjectDirectory)\bin\$(Configuration)\$(TargetFramework)\$(RuntimeIdentifier)" />
+    <RemoveDir Directories="$(MSBuildProjectDirectory)\obj\$(Configuration)\$(TargetFramework)\$(RuntimeIdentifier)" />
     <Error Code="PLCDH001"
-           Text="目标框架违规：项目 $(MSBuildProjectFile) 的 TargetFramework 为 '$(TargetFramework)'，但本项目必须为 net8.0-windows。原因：.NET 9/10 已放弃 Windows 10 支持，现场工控机大量为 Windows 10，升级会导致无法运行。请删除该 csproj 里的 &lt;TargetFramework&gt; 行，由 Directory.Build.props 统一提供。" />
+           Text="目标平台违规：项目 $(MSBuildProjectFile) 的 TargetFramework='$(TargetFramework)'、RuntimeIdentifier='$(RuntimeIdentifier)'，但本项目必须为 TFM=net8.0-windows 且 RID=win-x64。原因：.NET 9/10 已放弃 Windows 10 支持、现场工控机大量为 Windows 10；32 位进程有约 2GB 内存上限。请删除该 csproj 里私自覆盖的 &lt;TargetFramework&gt; / &lt;RuntimeIdentifier&gt; 行，由 Directory.Build.props 统一提供。" />
   </Target>
 
   <Target Name="EnforcePlcDataHubTargetFrameworks" BeforeTargets="Build"
