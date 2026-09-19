@@ -1,3 +1,4 @@
+using System.Reflection;
 using FluentAssertions;
 using PlcDataHub.Core.Model;
 using Xunit;
@@ -54,6 +55,23 @@ public class ConfigComparerSubObjectTests
     }
 
     [Fact]
+    public void 子对象字段清单必须与模型的公开属性完全一致()
+    {
+        // 防止：给 S7Address/ModbusAddress 加字段后忘记补本测试的清单，
+        // 导致该字段只有结构层防护 —— 一旦被写成 || true 就会两层同时失灵（结构层只看文本、
+        // 清单里又没有该字段的行为用例，此时没有任何信号）。
+        S7Fields().Select(row => (string)row[0])
+            .Should().BeEquivalentTo(
+                PropertyNamesOf(typeof(S7Address)),
+                "S7Fields() 必须覆盖 S7Address 的全部公开属性，新增字段时请同步补充");
+
+        ModbusFields().Select(row => (string)row[0])
+            .Should().BeEquivalentTo(
+                PropertyNamesOf(typeof(ModbusAddress)),
+                "ModbusFields() 必须覆盖 ModbusAddress 的全部公开属性，新增字段时请同步补充");
+    }
+
+    [Fact]
     public void 两个子对象都相同且非空时必须判为等价()
     {
         // 正向对照：子对象内容相同必须判等价，否则热加载会永远判定"已变更"
@@ -61,6 +79,10 @@ public class ConfigComparerSubObjectTests
                                       MakePoint2(new ModbusAddress(1, ModbusRegisterArea.HoldingRegister, 100)))
             .Should().BeTrue();
     }
+
+    /// <summary>公开实例属性名。口径与 ConfigComparerCoverageTests 一致（静态属性不参与配置比较）。</summary>
+    private static IEnumerable<string> PropertyNamesOf(Type type) =>
+        type.GetProperties(BindingFlags.Public | BindingFlags.Instance).Select(property => property.Name);
 
     /// <summary>S7 非空、Modbus 为 null 的点位。</summary>
     private static PointConfig MakePoint(S7Address s7) => new(
