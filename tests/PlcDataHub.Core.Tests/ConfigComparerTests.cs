@@ -44,6 +44,62 @@ public class ConfigComparerTests
         ConfigComparer.GroupsEquivalent(group1, group2).Should().BeFalse("顺序不同会影响建表列序，必须判为不等价");
     }
 
+    [Theory]
+    [InlineData(2, 1)]
+    [InlineData(1, 2)]
+    public void 采集点数量不同时必须判为不等价(int leftCount, int rightCount)
+    {
+        // 覆盖 PointsEquivalent 的 left.Count != right.Count 分支。增删点位是热加载最常见的变更：
+        // 删掉该分支后，left 多的一方会在 right[i] 处越界抛 ArgumentOutOfRangeException
+        // （热加载直接崩溃），left 少的一方则会静默返回 true（漏判变更、跳过重建）。
+        // 两个方向都必须在场 —— 它们分别对应上面两种不同的失效方式。
+        var group1 = MakeGroup(MakePoints(leftCount));
+        var group2 = MakeGroup(MakePoints(rightCount));
+
+        ConfigComparer.GroupsEquivalent(group1, group2)
+            .Should().BeFalse($"采集点数量不同（{leftCount} vs {rightCount}）必须判为不等价");
+    }
+
+    [Fact]
+    public void 采集点为_null_时必须抛出_ArgumentNullException()
+    {
+        // 热加载时"配置尚未加载"传 null 是常见场景，必须得到明确异常而不是 NullReferenceException
+        var point = MakePoint(1, "温度");
+
+        Action leftNull = () => ConfigComparer.PointEquivalent(null!, point);
+        Action rightNull = () => ConfigComparer.PointEquivalent(point, null!);
+
+        leftNull.Should().Throw<ArgumentNullException>();
+        rightNull.Should().Throw<ArgumentNullException>();
+    }
+
+    [Fact]
+    public void 采集组为_null_时必须抛出_ArgumentNullException()
+    {
+        var group = MakeGroup(new List<PointConfig> { MakePoint(1, "温度") });
+
+        Action leftNull = () => ConfigComparer.GroupsEquivalent(null!, group);
+        Action rightNull = () => ConfigComparer.GroupsEquivalent(group, null!);
+
+        leftNull.Should().Throw<ArgumentNullException>();
+        rightNull.Should().Throw<ArgumentNullException>();
+    }
+
+    [Fact]
+    public void 采集点集合为_null_时必须抛出_ArgumentNullException()
+    {
+        IReadOnlyList<PointConfig> points = new List<PointConfig> { MakePoint(1, "温度") };
+
+        Action leftNull = () => ConfigComparer.PointsEquivalent(null!, points);
+        Action rightNull = () => ConfigComparer.PointsEquivalent(points, null!);
+
+        leftNull.Should().Throw<ArgumentNullException>();
+        rightNull.Should().Throw<ArgumentNullException>();
+    }
+
+    private static IReadOnlyList<PointConfig> MakePoints(int count) =>
+        Enumerable.Range(1, count).Select(id => MakePoint(id, "温度")).ToList();
+
     private static PollGroup MakeGroup(IReadOnlyList<PointConfig> points) => new(
         GroupId: 1, ConnId: 1, GroupCode: "fast", GroupName: "快组",
         PeriodMs: 1000, TableName: "plc01_fast", Enabled: true, Points: points);
