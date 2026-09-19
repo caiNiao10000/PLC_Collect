@@ -135,4 +135,39 @@ public class ColumnNameGeneratorTests
         Encoding.UTF8.GetByteCount(result).Should().BeLessOrEqualTo(63);
         result.Should().NotContain("__");
     }
+
+    /// <summary>
+    /// 回归：锁定库的**第二种失败形态**。码表外汉字有两种，本用例专测"整字丢弃"那一种：
+    ///   U+9FD3         → 整字被丢弃，**不泄漏**非 ASCII（本用例）
+    ///   U+9FD6..U+9FFF → 段内逐个透传，会泄漏非 ASCII（由 码表外汉字透传时结果仍为纯_ASCII 覆盖）
+    /// 实测丢弃发生在库内部（不是本类的空串分支）：GetPinyin("\u9FD3") == ""，
+    /// 而放在连续汉字串里时库直接跳过该字并返回其余音节，如 GetPinyin("\u9FD3输出") == "Shu_Chu"。
+    /// 丢弃是安全降级（列名仍为纯 ASCII），代价是该字消失、其两侧的分隔符也随之合并。
+    /// </summary>
+    [Fact]
+    public void 库无法转换的汉字被丢弃而不是泄漏非ASCII()
+    {
+        const string unconvertible = "\u9FD3";
+
+        var withChar = ColumnNameGenerator.Normalize("PID" + unconvertible + "输出");
+        var withoutChar = ColumnNameGenerator.Normalize("PID输出");
+
+        // 该字被丢弃，且丢弃后**没有留下分隔符**，故两侧音节直接相接。
+        withChar.Should().Be("pidshu_chu");
+        withChar.Should().MatchRegex("^[a-z0-9_]+$");
+
+        // 丢弃是全路径一致的：无论该字是自成一段还是夹在连续汉字段内，都不会留下分隔符。
+        //   "A\u9FD3B"  -> 该字自成一段，库返回空串 -> 本类空串分支丢弃，两侧字母直接相接
+        //   "\u9FD3输出" -> 库在段内跳过该字 -> 结果同样无分隔符
+        ColumnNameGenerator.Normalize("A" + unconvertible + "B").Should().Be("ab");
+        ColumnNameGenerator.Normalize(unconvertible + "温度").Should().Be("wen_du");
+        ColumnNameGenerator.Normalize(unconvertible + "输出").Should().Be("shu_chu");
+
+        // 代价：不含该字的显示名会得到**同一个基名**（Normalize 不做去重）。
+        withChar.Should().Be(withoutChar, "该字被丢弃后与不含它的名字得到同一基名");
+
+        // 兜底去重在 AssignUniqueColumns：相同基名追加 _2，不会产出重复列名。
+        var assigned = ColumnNameGenerator.AssignUniqueColumns(new[] { "PID" + unconvertible + "输出", "PID输出" });
+        assigned.Should().Equal("pidshu_chu", "pidshu_chu_2");
+    }
 }
