@@ -1,5 +1,3 @@
-using System.Linq;
-
 namespace PlcDataHub.Core.Model;
 
 /// <summary>
@@ -20,35 +18,51 @@ namespace PlcDataHub.Core.Model;
 public static class ConfigComparer
 {
     /// <summary>按内容比较两个采集点是否等价。</summary>
-    public static bool PointEquivalent(PointConfig left, PointConfig right) =>
-        left.PointId == right.PointId
-        && left.PointCode == right.PointCode
-        && left.PointName == right.PointName
-        && left.ColumnName == right.ColumnName
-        && left.DataType == right.DataType
-        && left.ByteOrder == right.ByteOrder
-        && left.Scale.Equals(right.Scale)
-        && left.Offset.Equals(right.Offset)
-        && left.Enabled == right.Enabled
-        && S7Equivalent(left.S7, right.S7)
-        && ModbusEquivalent(left.Modbus, right.Modbus);
+    /// <exception cref="ArgumentNullException"><paramref name="left"/> 或 <paramref name="right"/> 为 null。</exception>
+    public static bool PointEquivalent(PointConfig left, PointConfig right)
+    {
+        ArgumentNullException.ThrowIfNull(left);
+        ArgumentNullException.ThrowIfNull(right);
+
+        return left.PointId == right.PointId
+            && left.PointCode == right.PointCode
+            && left.PointName == right.PointName
+            && left.ColumnName == right.ColumnName
+            && left.DataType == right.DataType
+            && left.ByteOrder == right.ByteOrder
+            && left.Scale.Equals(right.Scale)
+            && left.Offset.Equals(right.Offset)
+            && left.Enabled == right.Enabled
+            && S7Equivalent(left.S7, right.S7)
+            && ModbusEquivalent(left.Modbus, right.Modbus);
+    }
 
     /// <summary>按内容比较两个采集组是否等价（含组内全部采集点，按顺序）。</summary>
-    public static bool GroupsEquivalent(PollGroup left, PollGroup right) =>
-        left.GroupId == right.GroupId
-        && left.ConnId == right.ConnId
-        && left.GroupCode == right.GroupCode
-        && left.GroupName == right.GroupName
-        && left.PeriodMs == right.PeriodMs
-        && left.TableName == right.TableName
-        && left.Enabled == right.Enabled
-        && PointsEquivalent(left.Points, right.Points);
+    /// <exception cref="ArgumentNullException"><paramref name="left"/> 或 <paramref name="right"/> 为 null。</exception>
+    public static bool GroupsEquivalent(PollGroup left, PollGroup right)
+    {
+        ArgumentNullException.ThrowIfNull(left);
+        ArgumentNullException.ThrowIfNull(right);
+
+        return left.GroupId == right.GroupId
+            && left.ConnId == right.ConnId
+            && left.GroupCode == right.GroupCode
+            && left.GroupName == right.GroupName
+            && left.PeriodMs == right.PeriodMs
+            && left.TableName == right.TableName
+            && left.Enabled == right.Enabled
+            && PointsEquivalent(left.Points, right.Points);
+    }
 
     /// <summary>按内容+顺序比较两组采集点。</summary>
+    /// <exception cref="ArgumentNullException"><paramref name="left"/> 或 <paramref name="right"/> 为 null。</exception>
     public static bool PointsEquivalent(
         IReadOnlyList<PointConfig> left,
         IReadOnlyList<PointConfig> right)
     {
+        ArgumentNullException.ThrowIfNull(left);
+        ArgumentNullException.ThrowIfNull(right);
+
         if (ReferenceEquals(left, right))
         {
             return true;
