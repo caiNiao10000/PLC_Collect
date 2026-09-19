@@ -38,13 +38,23 @@ public static class ReadBlockPlanner
     /// <exception cref="ArgumentNullException"><paramref name="points"/> 为 null。</exception>
     /// <exception cref="ArgumentOutOfRangeException">
     /// <paramref name="mergeWindowRegisters"/> 或 <paramref name="maxRegistersPerRequest"/> 小于 1；
-    /// 或某个点的数据类型超出 <see cref="RegisterWidth"/> 的已知集合。
+    /// 或某个点的数据类型超出 <see cref="RegisterWidth"/> 的已知集合；
+    /// 或某个点的寄存器宽度大于 <paramref name="maxRegistersPerRequest"/>（见下方 remarks）。
     /// </exception>
     /// <remarks>
-    /// **本方法不校验 <paramref name="maxRegistersPerRequest"/> 与单个点宽度的关系**：
-    /// 若某个点自身占用的寄存器数就超过上限（例如上限 2 却有一个 LREAL 点占 4 个寄存器），
-    /// 该块的长度必然超过上限——这是**约束不足**，不是实现缺陷：一个点无法被拆到两次请求里
-    /// 解码。当前规格没有给出这种配置下的期望行为，故既不静默截断也不抛异常，见 task-6-report.md §7。
+    /// <para>
+    /// **单个点的寄存器宽度必须不大于 <paramref name="maxRegistersPerRequest"/>，否则响亮抛异常。**
+    /// 原因是物理性的：一个点的字节必须在**同一次响应**里被完整读回，无法拆到两次请求里再拼接
+    /// （拼接需要跨请求维护半截缓冲，而规格 5.1 节要求一条连接由一个线程独占、按请求闭环）。
+    /// 故这种配置下**必然**要发出一个超限请求，下游必然失败或静默截断——
+    /// 让失败发生在更远处（连接层、甚至 PLC 返回异常码）会极难归因到"某个点的类型与上限不匹配"。
+    /// 这是**配置期错误**，就该在规划期暴露：错误消息里点名是哪个点、宽度多少、上限多少。
+    /// </para>
+    /// <para>
+    /// 注意该检查只作用于**有 Modbus 地址的点**（即真正参与规划的点）；
+    /// 被 <see cref="PointConfig.Modbus"/> 过滤掉的点不参与校验。
+    /// 上限恰好等于点宽度是**合法**的（块长等于上限，不变量仍成立）。
+    /// </para>
     /// </remarks>
     public static IReadOnlyList<ReadBlock> PlanForModbus(
         IEnumerable<PointConfig> points,
@@ -62,6 +72,11 @@ public static class ReadBlockPlanner
         {
             throw new ArgumentOutOfRangeException(nameof(maxRegistersPerRequest), "单次请求上限必须至少为 1");
         }
+
+        // 先把"单个点就超限"这一配置期错误挡掉，再进入排队与分块。
+        // 校验必须与规划用同一套过滤（只看有 Modbus 地址的点），否则会出现
+        // "因为一个根本不会被规划的点而整组失败"的假失败。
+        EnsureNoPointExceedsRegisterLimit(points, maxRegistersPerRequest);
 
         var ordered = points
             .Where(p => p.Modbus is not null)
@@ -107,6 +122,48 @@ public static class ReadBlockPlanner
         blocks.Add(new ReadBlock(blockStart, blockEnd - blockStart, currentPoints));
 
         return blocks;
+    }
+
+    /// <summary>
+    /// 拦住"单个点的寄存器宽度就超过单请求上限"的配置。
+    /// </summary>
+    /// <remarks>
+    /// **为什么是 <see cref="ArgumentOutOfRangeException"/> 而不是 <see cref="InvalidOperationException"/>：**
+    /// <list type="bullet">
+    ///   <item>本例里**唯一出问题的参数值就是 <paramref name="maxRegistersPerRequest"/>**：
+    ///         那些点本身完全合法（一个 LREAL 点在任何"上限 ≥ 4"的配置下都合法），
+    ///         换一个更大的上限就立刻可用。故把参数名与实参带上，排障时一眼看到该改哪个数。
+    ///         这与"对象当前状态不允许该操作"（InvalidOperationException）的语义不同——
+    ///         这里没有状态，只有参数与输入不匹配。</item>
+    ///   <item>本方法已有的参数校验（窗口/上限小于 1）都用 <see cref="ArgumentOutOfRangeException"/>，
+    ///         保持调用方 catch 同一种异常即可覆盖全部参数问题。</item>
+    ///   <item>把出问题的点写进异常消息（而不是只报 <c>maxRegistersPerRequest=2</c>），
+    ///         因为"上限该设多大"取决于配置里最宽的那个点，而调用方从参数值本身看不出来。</item>
+    /// </list>
+    /// </remarks>
+    private static void EnsureNoPointExceedsRegisterLimit(
+        IEnumerable<PointConfig> points,
+        int maxRegistersPerRequest)
+    {
+        foreach (var point in points)
+        {
+            // 不参与规划的点（Modbus 地址为 null）不校验，与 PlanForModbus 的过滤保持一致；
+            // 否则会出现"因为一个根本不会被规划的点而整组失败"的假失败。
+            // 用单表达式条件而非 if+continue：把这段判定写成独立语句时，
+            // 任何"跳过校验"的变异都会立刻触发 CS0162（无法检测的代码）——那只能证明编译器在工作，
+            // 拿不到"断言失败"的合格证据。写成条件表达式后，同一变异产生可观测的行为差异。
+            if (point.Modbus is not null && RegisterWidth(point) > maxRegistersPerRequest)
+            {
+                var width = RegisterWidth(point);
+                throw new ArgumentOutOfRangeException(
+                    nameof(maxRegistersPerRequest),
+                    maxRegistersPerRequest,
+                    $"单次请求上限 {maxRegistersPerRequest} 个寄存器，小于采集点 {point.PointCode}（{point.PointName}）"
+                    + $" 的数据类型 {point.DataType} 所需的 {width} 个寄存器。"
+                    + "单个点必须在同一次响应里完整读回、无法拆到两次请求，故此配置必然发出超限请求。"
+                    + $"请把上限提高到至少 {width}，或把该点改为占用寄存器更少的数据类型。");
+            }
+        }
     }
 
     /// <summary>某个点占用多少个 Modbus 寄存器（16 位）。</summary>

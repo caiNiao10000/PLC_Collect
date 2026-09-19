@@ -306,6 +306,98 @@ public class ReadBlockPlannerTests
         act.Should().Throw<ArgumentNullException>().WithParameterName("points");
     }
 
+    // ===== 单点宽度超过单请求上限：控制者裁定"必须响亮抛异常"（原为仅注释说明） =====
+    // 物理原因：一个点的字节必须在同一次响应里完整读回，无法拆到两次请求再拼接，
+    // 故这种配置下必然发出超限请求 → 下游必然失败。让失败发生在更远处会极难归因。
+
+    [Fact]
+    public void 单点宽度超过单请求上限时抛异常并点名该点与两个数字()
+    {
+        // LREAL 占 4 个寄存器，上限给 2 → 必然超限。
+        // 断言**具体异常类型 + ParamName + 消息里的点标识与两个数字**，
+        // 不能只断言"抛了某个异常"（任何异常都能满足 → 假绿）。
+        var lreal = Point(7, 100, PointDataType.LReal);
+
+        var act = () => ReadBlockPlanner.PlanForModbus(new[] { lreal }, mergeWindowRegisters: 16, maxRegistersPerRequest: 2);
+
+        act.Should().Throw<ArgumentOutOfRangeException>()
+            .WithParameterName("maxRegistersPerRequest")
+            .WithMessage("*p7*", "必须点名是哪个点（PointCode）")
+            .WithMessage("*点7*", "必须点名是哪个点（PointName，排障时人看的是显示名）")
+            .WithMessage("*LReal*", "必须报出该点的数据类型")
+            .WithMessage("*4 个寄存器*", "必须报出该点需要多少寄存器")
+            .WithMessage("*上限 2 个寄存器*", "必须报出上限是多少")
+            .Where(e => Equals(e.ActualValue, 2), "ActualValue 必须就是那个上限，便于调用方直接读出来")
+            .Where(e => (e.Message ?? string.Empty).Contains("请把上限提高到至少 4", StringComparison.Ordinal),
+                "消息必须给出可执行的建议值（至少 4）");
+    }
+
+    [Fact]
+    public void 单点宽度超过上限时即使还有其他合规点也照样抛异常()
+    {
+        // 混入合规点不应让违规点被漏过：违规点在排好序的中间位置也不能幸免。
+        var points = new[]
+        {
+            Point(1, 100, PointDataType.Word),
+            Point(2, 200, PointDataType.LReal),
+            Point(3, 300, PointDataType.Word),
+        };
+
+        var act = () => ReadBlockPlanner.PlanForModbus(points, mergeWindowRegisters: 16, maxRegistersPerRequest: 3);
+
+        act.Should().Throw<ArgumentOutOfRangeException>()
+            .WithParameterName("maxRegistersPerRequest")
+            .WithMessage("*p2*");
+    }
+
+    [Fact]
+    public void 上限恰好等于最宽点的宽度时是合法的()
+    {
+        // 边界另一侧：上限 4 恰好容纳 LREAL 的 4 个寄存器 → 必须正常出计划。
+        // 与上一条配对，防止把判定写成 >= 而把合法配置也拦掉（那是"响亮"变成"误报"）。
+        var lreal = Point(1, 100, PointDataType.LReal);
+
+        var blocks = ReadBlockPlanner.PlanForModbus(new[] { lreal }, mergeWindowRegisters: 16, maxRegistersPerRequest: 4);
+
+        blocks.Should().ContainSingle();
+        blocks[0].Length.Should().Be(4, "块长恰好等于上限是允许的");
+    }
+
+    [Fact]
+    public void 没有_Modbus_地址的宽点不参与上限校验()
+    {
+        // 校验必须与规划用同一套过滤：一个根本不会被规划的点不该让整组失败。
+        var s7LReal = new PointConfig(
+            PointId: 1, PointCode: "s7wide", PointName: "S7宽点", ColumnName: "s7wide",
+            DataType: PointDataType.LReal, ByteOrder: ByteOrder.Big, Scale: 1.0, Offset: 0.0,
+            Enabled: true, S7: new S7Address(S7Area.DataBlock, 1, 0, 0), Modbus: null);
+
+        var blocks = ReadBlockPlanner.PlanForModbus(
+            new[] { s7LReal, Point(2, 100) }, mergeWindowRegisters: 16, maxRegistersPerRequest: 2);
+
+        blocks.Should().ContainSingle();
+        blocks[0].Points.Should().ContainSingle();
+    }
+
+    [Fact]
+    public void 上限小于最宽点时只枚举到第一个违规点就抛异常()
+    {
+        // 与"参数校验发生在遍历点集之前"同类：这是配置错误，不该把整份点集读完再报。
+        // 若将来有人把校验搬进分块循环内部，这条会红。
+        var enumerated = 0;
+
+        IEnumerable<PointConfig> Lazy()
+        {
+            enumerated++;
+            yield return Point(1, 100, PointDataType.LReal);
+        }
+
+        var act = () => ReadBlockPlanner.PlanForModbus(Lazy(), mergeWindowRegisters: 16, maxRegistersPerRequest: 2);
+
+        act.Should().Throw<ArgumentOutOfRangeException>();
+        enumerated.Should().Be(1, "只需枚举到第一个违规点即可失败，不应把整份点集读完");
+    }
+
     [Fact]
     public void 没有_Modbus_地址的点被排除在计划之外()
     {
