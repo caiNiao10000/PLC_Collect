@@ -13,4 +13,16 @@
     <Compile Remove="tests\**" />
     <None Remove="tests\**" />
   </ItemGroup>
+  <ItemGroup>
+    <!--
+      汉字转拼音（全拼）。规格 3.5 节要求中文列名转全拼，故必须用 Pinyin 包。
+      ⚠️ 不要换成 ToolGood.Words.FirstPinyin：那个包是"拼音首字母"库，
+         GetFirstPinyin("温度") 返回 "WD" 而非 "wen_du"，无法满足规格 3.5 节。
+         本机已实测确认（见 task-3-report.md 的拼音库实测小节）。
+      实测 API（3.0.1.4）：ToolGood.Words.Pinyin.WordsHelper.GetPinyin(string text, string splitSpan, bool tone)
+         tone:false → 无声调，如 "Wen"；tone:true → 带声调，如 "Wēn"。
+         返回首字母大写，故调用方须 ToLowerInvariant。
+    -->
+    <PackageReference Include="ToolGood.Words.Pinyin" Version="3.0.1.4" />
+  </ItemGroup>
 </Project>
