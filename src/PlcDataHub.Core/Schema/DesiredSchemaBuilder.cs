@@ -109,7 +109,8 @@ public static class DesiredSchemaBuilder
             {
                 throw new InvalidOperationException(
                     existing == column.Name
-                        ? $"表 {tableName} 中存在重复列名 {column.Name}，请修改其中一个采集点的手工列名。"
+                        ? $"表 {tableName} 中存在重复列名 {column.Name}，请修改其中一个采集点的列名，" +
+                          "或检查是否有手工列名 / 显示名恰好写成了固定列名（ts / q / src_ts）。"
                         : $"表 {tableName} 中存在仅大小写不同的重复列名：{existing} 与 {column.Name}。" +
                           "PostgreSQL 未加引号的标识符大小写不敏感，两者在库中是同一列，建表必失败。" +
                           "请修改其中一个采集点的手工列名。");

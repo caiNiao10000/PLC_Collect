@@ -28,34 +28,38 @@ public class DesiredSchemaBuilderTests
     }
 
     /// <summary>
-    /// 类型映射的**覆盖护栏**（与上一条 Theory 配套，两者必须同步）。
+    /// 类型映射的**覆盖护栏**：Theory 断言过的类型集合必须与枚举成员集合**相等**（不只是条数相等）。
     /// <para>
-    /// 上一条 Theory 是逐条 <see cref="InlineDataAttribute"/> 列出的，将来给
-    /// <see cref="PointDataType"/> 加了枚举成员、却只更新了 <see cref="SqlTypeMapper"/> 或只更新了
-    /// Theory 数据时，都会在本用例被拦下：
-    /// 枚举成员数与 Theory 条数**必须相等**，任一侧单方面变动都会让等号破裂。
+    /// 为什么必须是"集合相等"而不是"条数相等"：条数相等挡不住**替换**这类改动 ——
+    /// 例如删掉 <c>UDInt</c> 那行、再加一条重复的 <c>Int</c> 行，条数仍是 14，
+    /// 而 <c>UDInt</c> 悄悄失去覆盖。集合比对则替换、重复、缺漏都会被抓住。
     /// </para>
     /// <para>
-    /// 这里刻意**不去反射读 Theory 上的 InlineData 值** —— 那需要调
-    /// <c>InlineDataAttribute.GetData(null!)</c>，依赖"xunit 当前版本不校验该参数"这一
-    /// **未承诺行为**，将来升级 xunit 会以与业务无关的方式变红。
-    /// 改为从 <c>Enum.GetValues</c> 推导期望条数：它遍历的是**每一个**枚举成员，
-    /// 是编译期事实，不依赖任何未承诺的运行时行为。
-    /// <c>14</c> 不是随手写的常量 —— 它是"枚举成员数"，本用例就是要求 Theory 与它一一对应。
+    /// 读 <c>InlineData</c> 的值用 <c>GetData(真实 MethodInfo)</c> —— 这是该 API 的
+    /// **文档契约用法**（xunit 用它在运行 Theory 时校验数据与形参匹配）。
+    /// 上一版曾用 <c>GetData(null!)</c>，那依赖"xunit 不校验该参数"这一**未承诺行为**，
+    /// 升级 xunit 会以与业务无关的方式变红，故已弃用。
     /// </para>
     /// </summary>
     [Fact]
     public void 类型映射测试覆盖了全部数据类型枚举成员()
     {
-        var enumMembers = Enum.GetValues<PointDataType>();
+        var theoryMethod = typeof(DesiredSchemaBuilderTests)
+            .GetMethod(nameof(类型映射符合规格_3_4_节))!;
 
-        // Theory 的 [InlineData] 条目数与枚举成员数必须相等（当前各 14 条）
-        typeof(DesiredSchemaBuilderTests).GetMethod(nameof(类型映射符合规格_3_4_节))!
+        var assertedTypes = theoryMethod
             .GetCustomAttributes(typeof(InlineDataAttribute), inherit: false)
-            .Length
-            .Should().Be(
-                enumMembers.Length,
-                "Theory 必须为每个枚举成员各列一条断言；新增枚举成员时请同步补 Theory 数据与映射");
+            .Cast<InlineDataAttribute>()
+            .SelectMany(a => a.GetData(theoryMethod))
+            .Select(args => (PointDataType)args[0])
+            .ToHashSet();
+
+        var enumMembers = Enum.GetValues<PointDataType>().ToHashSet();
+
+        // 集合相等：新增成员漏补数据、重复/替换行、缺漏都会被这一条抓住
+        assertedTypes.Should().BeEquivalentTo(
+            enumMembers,
+            "Theory 必须为每个枚举成员各断言一条，且不得重复或替换；新增成员时请同步补数据与映射");
 
         // 且每个成员都必须真的能映射（漏映射会让 SqlTypeMapper 抛异常）
         foreach (var member in enumMembers)
@@ -214,8 +218,8 @@ public class DesiredSchemaBuilderTests
     /// 候选 wen_du 被占 → wen_du_2 也被占 → 只有序号继续递增到 wen_du_3 才能跳出 while。
     /// 若序号不递增，候选恒为 wen_du_2、恒判占用 ⇒ **死循环**（本用例将挂住而非失败）。
     /// 实测该场景真实输出：ts | q | src_ts | wen_du | wen_du_2 | wen_du_3。
-    /// 除唯一性外**额外锁死** wen_du_3 —— 这是全任务唯一锁具体列名之处，理由见用例内注释：
-    /// 它是"序号递增"的唯一可观测证据，且能返回的实现在此不存在其它可能取值。
+    /// **只断言唯一性与"自动名不与手工名冲突"，不锁 wen_du_3** ——
+    /// 该断言对终止性零边际价值（见用例内说明），却会让"换一种避让策略但仍终止且唯一"的实现变红。
     /// </summary>
     [Fact]
     public void 候选名被手工名连环占用时仍能终止且列名唯一()
@@ -239,15 +243,13 @@ public class DesiredSchemaBuilderTests
         names.Should().Contain("wen_du", "手工列名必须原样保留");
         names.Should().Contain("wen_du_2", "手工列名必须原样保留");
 
-        // 先只断言"自动名不与任何手工名冲突"（不锁具体避让风格）
+        // 只断言"自动名不与任何手工名冲突"，**不锁**具体避让成哪个名字 —— 那是命名风格，不是契约。
+        // 本用例的可观测性来自"能返回"这件事本身：本 fixture 强制走满 while 第 2 轮
+        // （两个候选名都被手工名占死），故序号不递增的实现会**死循环**而不是返回。
+        // 而且"只跑 1 轮就交出 wen_du_2"的实现会被上面的 OnlyHaveUniqueItems 抓住，
+        // 无需再靠断言某个具体名字来兜。
         autoName.Should().NotBe("wen_du");
         autoName.Should().NotBe("wen_du_2");
-
-        // 此处是本任务**唯一**锁死具体列名的断言，理由：它是"序号递增"的唯一可观测证据。
-        // 走完第 2 轮的唯一方式是序号由 2 递增到 3；若序号不递增，候选恒为 wen_du_2、
-        // 恒判占用 ⇒ 死循环（该实现根本无法返回）。因此一个能正常返回的实现在此**只可能**是
-        // wen_du_3 —— 两个手工名已占死前两个候选，没有别的命名风格可选。
-        names[5].Should().Be("wen_du_3", "序号必须递增才能跳出避让循环，否则死循环");
     }
 
     private static DeviceConnection MakeConnection() => new(

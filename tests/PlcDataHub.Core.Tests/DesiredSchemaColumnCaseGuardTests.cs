@@ -116,6 +116,36 @@ public class DesiredSchemaColumnCaseGuardTests
             .WithMessage("*wen_du*");
     }
 
+    /// <summary>
+    /// 守卫放在 <c>BuildTable</c> 末尾，对**全部列**（含 3 个固定列）生效，而不只是数据列 ——
+    /// 故手工列名写 <c>TS</c> 会撞上固定列 <c>ts</c>：两者在 PG 里是同一列，建表必失败。
+    /// 本用例锁定代码注释里"顺带覆盖固定列"这一声称（此前只是声称、无测试）。
+    /// </summary>
+    [Fact]
+    public void 手工列名与固定列仅大小写不同时抛异常()
+    {
+        var act = () => Build(new[] { MakePoint(1, "手工点", "TS") });
+
+        act.Should().Throw<InvalidOperationException>()
+            .WithMessage("*ts*TS*");
+    }
+
+    /// <summary>
+    /// 自动生成列名（由显示名 <c>ts</c> 生成 <c>ts</c>）撞上固定列 <c>ts</c> 时，
+    /// 走的是"**完全相同**的重复"分支，故消息用的是"存在重复列名"措辞、
+    /// 且提示里同时涵盖"手工列名 / 显示名写成固定列名"这一来源 ——
+    /// 该分支不止手工列名能触发，显示名恰好是 <c>ts</c>/<c>q</c>/<c>src_ts</c> 同样能触发。
+    /// </summary>
+    [Fact]
+    public void 显示名恰好等于固定列名时给出准确措辞()
+    {
+        var act = () => Build(new[] { MakePoint(1, "ts", "") });
+
+        act.Should().Throw<InvalidOperationException>()
+            .WithMessage("*存在重复列名*")
+            .WithMessage("*固定列名*");
+    }
+
     private static DesiredSchema Build(IReadOnlyList<PointConfig> points) =>
         DesiredSchemaBuilder.Build(
             new[] { MakeConnection() },
