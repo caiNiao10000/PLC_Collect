@@ -2638,6 +2638,11 @@ git commit -m "feat: 读块合并与字节解码
 
 3. **`ByteDecoder` 对 `Bool` / `Dtl` / `String` 抛 `NotSupportedException`，不要试图在连接层绕过。**
    `Bool` 必须走 `DecodeBool(buffer, byteOffset, bitOffset)`；`Dtl` 与 `String` 本期不支持。
+   > **⚠️ 接口签名以实现为准：`DecodeBool` 返回 `bool?`，不是 brief 早先写的 `bool`。**
+   > （`bool` 装不下"缓冲区不足返回 null"这条契约；Task 6 已按 `bool?` 实现并测试。）
+4. **采集器必须按点捕获 `NotSupportedException`，不能让一个点的配置错误中断整轮采集。**
+   理由：`Dtl` / `String` 在**规划层仍占带宽**（4 / 1 寄存器）、**到解码层才抛**——即一个不支持的配置会**每个采集周期各抛一次**。若异常冒泡到采集循环，整个采集组每周期中断。
+   正确做法：该点本轮写坏值（NULL），其余点正常；并把"该点类型本期不支持"作为**配置错误**在状态里明确暴露（而不是伪装成偶发读取失败）。
 
 ### 已知模型限制（不得在本任务"顺手绕过"，需保持现状）
 
