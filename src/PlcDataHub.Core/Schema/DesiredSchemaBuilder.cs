@@ -52,7 +52,48 @@ public static class DesiredSchemaBuilder
                 IsNullable: true));
         }
 
+        GuardAgainstCaseInsensitiveDuplicateColumns(group.TableName, columns);
+
         return new DesiredTable(group.TableName, columns);
+    }
+
+    /// <summary>
+    /// 列名**大小写不敏感**占用的最后一道防线（规格 3.5 节 + 3.2 节"同一组内 column_name 唯一"）。
+    /// <para>
+    /// PostgreSQL 未加引号的标识符大小写不敏感、会被折叠成小写，故 <c>Wen_Du</c> 与 <c>wen_du</c>
+    /// 在库里是**同一列**：期望结构里两者并存，生成的 CREATE TABLE 必报 duplicate column name。
+    /// </para>
+    /// <para>
+    /// 为什么是"抛异常"而不是静默小写化或去重：静默改写用户输入会让"配置写 <c>Wen_Du</c>、
+    /// 库里却是 <c>wen_du</c>"，之后按配置查库会找不到列，是更难查的故障；静默丢弃更糟。
+    /// 在配置期响亮失败、并点名冲突的两个列名，用户才知道该改哪个。与本项目"绝不静默"的取向一致。
+    /// </para>
+    /// <para>
+    /// 覆盖两个来源：手工列名之间、以及手工列名与自动生成列名之间。
+    /// （自动名恒为纯小写 —— <c>ColumnNameGenerator.Normalize</c> 对 ASCII 大写字母做
+    /// <c>ToLowerInvariant</c>，且结果由既有测试锁定为 <c>^[a-z0-9_]+$</c> ——
+    /// 故自动名之间不可能仅大小写不同。）
+    /// </para>
+    /// </summary>
+    /// <exception cref="InvalidOperationException">存在仅大小写不同的重复列名。</exception>
+    private static void GuardAgainstCaseInsensitiveDuplicateColumns(
+        string tableName,
+        IReadOnlyList<DesiredColumn> columns)
+    {
+        var seen = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var column in columns)
+        {
+            if (seen.TryGetValue(column.Name, out var existing))
+            {
+                throw new InvalidOperationException(
+                    $"表 {tableName} 中存在仅大小写不同的重复列名：{existing} 与 {column.Name}。" +
+                    "PostgreSQL 未加引号的标识符大小写不敏感，两者在库中是同一列，建表必失败。" +
+                    "请修改其中一个采集点的手工列名。");
+            }
+
+            seen.Add(column.Name, column.Name);
+        }
     }
 
     /// <summary>
