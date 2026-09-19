@@ -2649,6 +2649,13 @@ git commit -m "feat: 读块合并与字节解码
    理由：从站返回异常码（01 不支持该功能码 / 02 地址超设备范围）**恰是现场最常见的配置错误形态**，而它按规格 5.3 被降级为坏点（正确：链路是好的，不该重连）。但若**没有任何错误信号**，它就和"偶发读失败"完全不可区分——"某个点每周期静默写 NULL、无人知道为什么"，与本项目最怕的失效同类。
    → 连接层在 `SlaveException` 与传输失败分支都写入 `LastError`，供 Plan 2 报进 `rt.group_status`。
 
+6. **采集器必须区分"链路已失效"与"本块坏点"，并接受同一个现场故障可能落在不同类别。**
+   `ConnectionFailureKind` 有三类：`SlaveRejected`（链路好、该块被拒）/ `Transport`（链路坏）/ `Unexpected`（冒泡的未预期异常）。
+   **关键约束（实测依据）**：同一个现场故障（设备消失 / 对端 RST）**可能先表现为 `Transport`、也可能先表现为 `Unexpected`**，取决于首次失败的时序。
+   → **Plan 2 的状态层应把 `Transport` 与 `Unexpected` 都按"链路不可用、该重连"展示，只在日志里区分**（前者查现场链路、后者查软件缺陷）。**不要按类别做不同的告警分级**——那会把同一故障显示成两种严重程度。
+   > 另注：`LastError` 是**粘性**语义（成功不清空），Plan 2 不能把它直接当"当前状态"展示，必须配合 `IsConnected` 与本轮结果。
+   > 另注：`IsConnected == false` 后**只有 `ConnectAsync` 能置回 true**——采集器的重连逻辑必须在该状态下调用 `ConnectAsync`，否则会一直拿到"尚未连接"。
+
 ### 已知模型限制（不得在本任务"顺手绕过"，需保持现状）
 
 - **小端语义 = 整值字节逆序，不是 word-swapped。** 真实 Modbus 设备有四种字节序（ABCD / DCBA / BADC / CDAB），而 `ByteOrder` 只有 `Big`/`Little`，**无法表达 word-swapped（BADC / CDAB）**。若现场遇到此类设备，需扩模型而非在连接层做特例。
