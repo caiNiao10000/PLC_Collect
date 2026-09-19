@@ -17,16 +17,40 @@
   -->
   <Target Name="EnforcePlcDataHubTargetFramework" BeforeTargets="PrepareForBuild;Build"
           Condition="('$(TargetFramework)' != '' and '$(TargetFramework)' != 'net8.0-windows')
-                     or ('$(RuntimeIdentifier)' != '' and '$(RuntimeIdentifier)' != 'win-x64')">
-    <!-- 兜底清理：若上一次构建已在 bin/obj 留下逃逸产物，报错前一并清掉。
-         net10 产物位于 bin\$(Configuration)\$(TargetFramework)，
-         RID 变更的产物位于 ...\$(TargetFramework)\$(RuntimeIdentifier)。 -->
-    <RemoveDir Directories="$(MSBuildProjectDirectory)\bin\$(Configuration)\$(TargetFramework)" />
-    <RemoveDir Directories="$(MSBuildProjectDirectory)\obj\$(Configuration)\$(TargetFramework)" />
-    <RemoveDir Directories="$(MSBuildProjectDirectory)\bin\$(Configuration)\$(TargetFramework)\$(RuntimeIdentifier)" />
-    <RemoveDir Directories="$(MSBuildProjectDirectory)\obj\$(Configuration)\$(TargetFramework)\$(RuntimeIdentifier)" />
+                     or ('$(RuntimeIdentifier)' != '' and '$(RuntimeIdentifier)' != 'win-x64')
+                     or ('$(RuntimeIdentifiers)' != '' and '$(RuntimeIdentifiers)' != 'win-x64')">
+
+    <!-- ===== 情形一：TFM 本身违规 =====
+         该 TFM 下所有产物都不可信（可能是 net9/net10 的），删整棵。
+         显式写 '$(TargetFramework)' != 'net8.0-windows'，确保与情形二互斥、不重复删除。 -->
+    <RemoveDir Directories="$(MSBuildProjectDirectory)\bin\$(Configuration)\$(TargetFramework)"
+               Condition="'$(Configuration)' != '' and '$(TargetFramework)' != '' and '$(TargetFramework)' != 'net8.0-windows'" />
+    <RemoveDir Directories="$(MSBuildProjectDirectory)\obj\$(Configuration)\$(TargetFramework)"
+               Condition="'$(Configuration)' != '' and '$(TargetFramework)' != '' and '$(TargetFramework)' != 'net8.0-windows'" />
+
+    <!-- ===== 情形二：TFM 合规、仅 RID 违规 =====
+         只删该 RID 这一层，保留同一 TFM 下本来有效的 win-x64 产物。
+         （修复轮 2 的写法在此处会连带删掉合规的 win-x64 产物，是错的。） -->
+    <RemoveDir Directories="$(MSBuildProjectDirectory)\bin\$(Configuration)\$(TargetFramework)\$(RuntimeIdentifier)"
+               Condition="'$(Configuration)' != '' and '$(TargetFramework)' == 'net8.0-windows' and '$(RuntimeIdentifier)' != '' and '$(RuntimeIdentifier)' != 'win-x64'" />
+    <RemoveDir Directories="$(MSBuildProjectDirectory)\obj\$(Configuration)\$(TargetFramework)\$(RuntimeIdentifier)"
+               Condition="'$(Configuration)' != '' and '$(TargetFramework)' == 'net8.0-windows' and '$(RuntimeIdentifier)' != '' and '$(RuntimeIdentifier)' != 'win-x64'" />
+    <RemoveDir Directories="$(MSBuildProjectDirectory)\bin\$(Configuration)\$(TargetFramework)\$(RuntimeIdentifiers)"
+               Condition="'$(Configuration)' != '' and '$(TargetFramework)' == 'net8.0-windows' and '$(RuntimeIdentifiers)' != '' and '$(RuntimeIdentifiers)' != 'win-x64'" />
+    <RemoveDir Directories="$(MSBuildProjectDirectory)\obj\$(Configuration)\$(TargetFramework)\$(RuntimeIdentifiers)"
+               Condition="'$(Configuration)' != '' and '$(TargetFramework)' == 'net8.0-windows' and '$(RuntimeIdentifiers)' != '' and '$(RuntimeIdentifiers)' != 'win-x64'" />
+
+    <!-- ===== 报错 =====
+         条件里加了 '$(Configuration)' != '' 守卫，避免 Configuration 为空时
+         路径塌缩成 bin\\ 这类过宽的删除路径。 -->
     <Error Code="PLCDH001"
-           Text="目标平台违规：项目 $(MSBuildProjectFile) 的 TargetFramework='$(TargetFramework)'、RuntimeIdentifier='$(RuntimeIdentifier)'，但本项目必须为 TFM=net8.0-windows 且 RID=win-x64。原因：.NET 9/10 已放弃 Windows 10 支持、现场工控机大量为 Windows 10；32 位进程有约 2GB 内存上限。请删除该 csproj 里私自覆盖的 &lt;TargetFramework&gt; / &lt;RuntimeIdentifier&gt; 行，由 Directory.Build.props 统一提供。" />
+           Condition="'$(Configuration)' != ''"
+           Text="目标平台违规：项目 $(MSBuildProjectFile) 的 TargetFramework='$(TargetFramework)'、RuntimeIdentifier='$(RuntimeIdentifier)'、RuntimeIdentifiers='$(RuntimeIdentifiers)'，但本项目必须为 TFM=net8.0-windows 且 RID=win-x64。请对照上面三项实际值，删除该 csproj 里私自覆盖的 &lt;TargetFramework&gt; / &lt;RuntimeIdentifier&gt; / &lt;RuntimeIdentifiers&gt; 行，由 Directory.Build.props 统一提供。原因：.NET 9/10 已放弃 Windows 10 支持、现场工控机大量为 Windows 10；32 位进程有约 2GB 内存上限。" />
+    <!-- Configuration 为空属于异常场景（无输出路径可清理，也不应报路径相关的错），
+         但仍需拦下违规，退化为不含清理的报错。 -->
+    <Error Code="PLCDH001"
+           Condition="'$(Configuration)' == ''"
+           Text="目标平台违规：项目 $(MSBuildProjectFile) 的 TargetFramework='$(TargetFramework)'、RuntimeIdentifier='$(RuntimeIdentifier)'、RuntimeIdentifiers='$(RuntimeIdentifiers)'，但本项目必须为 TFM=net8.0-windows 且 RID=win-x64。请删除该 csproj 里私自覆盖的 &lt;TargetFramework&gt; / &lt;RuntimeIdentifier&gt; / &lt;RuntimeIdentifiers&gt; 行，由 Directory.Build.props 统一提供。" />
   </Target>
 
   <Target Name="EnforcePlcDataHubTargetFrameworks" BeforeTargets="Build"
