@@ -1,3 +1,4 @@
+using System.Collections;
 using FluentAssertions;
 using PlcDataHub.Core.Model;
 using PlcDataHub.Protocols;
@@ -135,18 +136,24 @@ public class ReadBlockPlannerTests
         // 以 Real 覆盖了宽度 2，于是 RegisterWidth(Real) 2→1、RegisterWidth(SInt) 1→2
         // 两个变异都完全不可观测（82 条全绿）。本表把每个数值类型都钉进一个真值用例。
         //
-        // 每个用例用**两个薄探针**把宽度 W 夹住。设同一对点 (base, base+W+1)：
-        //   宽度正确（W） → 块终点 = base+W+1，间隔 1 < 2 → 单块，Length = W+2   …… 探针甲
-        //   宽度偏大（W+1）→ 块终点 = base+W+2，间隔 0 < 2 → 单块，Length = W+3
-        //   宽度偏小（W-1）→ 块终点 = base+W，  间隔 2 ≮ 2 → 拆两块
-        // 再用第二对点 (base, base+W+2)：
-        //   宽度正确（W） → 间隔 2 ≮ 2 → 拆两块                                  …… 探针乙
-        //   宽度偏小（W-1）→ 间隔 1 < 2 → 单块，Length = W+2
-        // 甲、乙两条断言合起来使 W-1 与 W+1 **两个方向都必然可观测**。
+        // 每个用例用**两个薄探针**把宽度 W 夹住，两个探针的第二点地址都是**字面量**（不随变异移动）：
         //
-        // ⚠️ 实测教训（本用例改了两版才对）：只用一个探针时，宽度的两个方向里总有一个
-        // 恰好与期望值重合而不可观测——第一版几何 (base+W, 期望 W+1) 漏掉了 Real 的 2→1；
-        // 第二版几何 (base+W+1, 期望 W+2) 又漏掉了 SInt 的 1→2。两次都是 82 条全绿。
+        // 探针甲：两点为 (base, base+W+1)，窗口 2。
+        //   宽度正确（W）  → 块终点 = base+W+1，空档 1 < 2 → 单块，Length = W+2（= W+2）成立
+        //   宽度偏小（W-1）→ 块终点 = base+W，  空档 2 ≮ 2 → **拆成两块** → ContainSingle 失败 ⇒ 甲检出 W-1
+        //   宽度偏大（W+1）→ 块终点 = base+W+2 > 第二点，空档为负 → 仍单块，Length = W+3
+        //                    → 长度断言（期望 W+2）失败 ⇒ 甲**也**检出 W+1
+        // 探针乙：两点为 (base, base+W+2)，窗口 2。
+        //   宽度正确（W）  → 空档 2 ≮ 2 → 拆两块，HaveCount(2) 成立
+        //   宽度偏大（W+1）→ 块终点 = base+W+2 = 第二点，空档 0 < 2 → **并成一块** → HaveCount(2) 失败 ⇒ 乙检出 W+1
+        //   宽度偏小（W-1）→ 空档 3 ≮ 2 → 仍拆两块 → 乙看不见 W-1
+        // 甲、乙合起来使 W-1 与 W+1 两个方向都必然可观测（变异实测：Real 2→1 与 SInt 1→2 均各自被检出）。
+        //
+        // ⚠️ 两处实测教训（都已踩过）：
+        //   ① 本用例改了两版才对：第一版几何 (base+W, 期望 W+1) 漏掉 Real 的 2→1；
+        //      第二版几何 (base+W+1, 期望 W+2) 漏掉 SInt 的 1→2。两次都是 82 条全绿。
+        //   ② **失败消息的方向标签一度写反**（把"甲检出 W-1"写成检出 W+1）。写反的后果是：
+        //      将来有人看到红测试，会按消息去查**错的**变异方向。故标签必须与上面的推演一致。
         var widths = new (PointDataType Type, int Width)[]
         {
             (PointDataType.Bool, 1),
@@ -168,7 +175,8 @@ public class ReadBlockPlannerTests
             var (type, width) = widths[i];
             var start = 100 + (50 * i);
 
-            // 探针甲：下一个点落在 base+W+1，期望合并成一块、长度 W+2
+            // 探针甲：下一个点落在 base+W+1，期望合并成一块、长度 W+2。
+            // 检出**宽度偏小**（拆块）也检出**宽度偏大**（长度变成 W+3）。
             var probeA = new[]
             {
                 Point(1, start, type),
@@ -178,13 +186,15 @@ public class ReadBlockPlannerTests
             var blocksA = ReadBlockPlanner.PlanForModbus(probeA, mergeWindowRegisters: 2, maxRegistersPerRequest: 120);
 
             blocksA.Should().ContainSingle(
-                $"[甲] {type}（宽度 {width}）与其后第 {width + 1} 个寄存器的点间隔 1，必须合并成一个块");
+                $"[甲] {type}（宽度 {width}）与其后第 {width + 1} 个寄存器的点空档 1，必须合并成一个块；" +
+                $"若宽度被算小 {width - 1}，空档会变成 2 而被窗口挡开、拆成两块");
             blocksA[0].StartAddress.Should().Be(start);
             blocksA[0].Length.Should().Be(
                 width + 2,
-                $"[甲] {type} 的寄存器宽度必须是 {width}；取 {width + 1} 会让块长为 {width + 3}");
+                $"[甲] {type} 的寄存器宽度必须是 {width}；若宽度被算大 {width + 1}，块终点会越过第二个点，块长变成 {width + 3}");
 
-            // 探针乙：下一个点落在 base+W+2，期望间隔 2 顶到窗口边界而拆成两块
+            // 探针乙：下一个点落在 base+W+2，期望空档 2 顶到窗口边界而拆成两块。
+            // 检出**宽度偏大**（两块并成一块）；宽度偏小时空档更大，仍是两块 → 乙看不见 W-1。
             var probeB = new[]
             {
                 Point(1, start, type),
@@ -195,10 +205,59 @@ public class ReadBlockPlannerTests
 
             blocksB.Should().HaveCount(
                 2,
-                $"[乙] {type} 的寄存器宽度必须是 {width}；若被算小，间隔会降到 1 而被窗口吸收，两块会并成一块");
+                $"[乙] {type} 的寄存器宽度必须是 {width}；若宽度被算大 {width + 1}，空档会降到 0 而被窗口吸收，两块并成一块");
             blocksB[0].StartAddress.Should().Be(start);
             blocksB[1].StartAddress.Should().Be(start + width + 2);
         }
+    }
+
+    [Theory]
+    // Dtl 与 String 的宽度是**可观测的规划输入**，但上面的数值类型表只覆盖了 12 个数值类型。
+    // 单点块的 Length 恰好等于该点的宽度，故这是最直接的宽度探针。
+    // 注意：这里锁的是"规划层仍按占位宽度占带宽"这一**当前行为**，不是"这两个类型可用"——
+    // 它们在解码层会抛 NotSupportedException（见 ByteDecoderTests）。
+    // 控制者已裁定：**不要把 RegisterWidth 对二者也改成抛异常**，否则
+    // "配置里有一个 DTL 点"会导致整组规划失败，而当前形态只影响该点（局部失效优于整组失效）。
+    [InlineData(PointDataType.Dtl, 4)]      // S7 DATE_AND_TIME 占 8 字节 = 4 个寄存器
+    [InlineData(PointDataType.String, 1)]   // 占位值 1；真实宽度需地址表配置，PointConfig 无长度字段
+    public void 单点块的宽度等于该类型的寄存器宽度(PointDataType type, int expectedWidth)
+    {
+        var blocks = ReadBlockPlanner.PlanForModbus(
+            new[] { Point(1, 100, type) }, mergeWindowRegisters: 16, maxRegistersPerRequest: 120);
+
+        blocks.Should().ContainSingle();
+        blocks[0].StartAddress.Should().Be(100);
+        blocks[0].Length.Should().Be(expectedWidth, $"{type} 的寄存器宽度必须是 {expectedWidth}");
+    }
+
+    [Fact]
+    public void 宽点与窄点相邻时按各自真实宽度决定块终点()
+    {
+        // 宽度探针的第二形态：Dtl（4 寄存器）在前、String（1 寄存器）紧跟在 +4 处。
+        // 若 Dtl 宽度被算错（例如 1），第二点就不再"紧邻"，块结构会变。
+        var blocks = ReadBlockPlanner.PlanForModbus(
+            new[] { Point(1, 100, PointDataType.Dtl), Point(2, 104, PointDataType.String) },
+            mergeWindowRegisters: 16, maxRegistersPerRequest: 120);
+
+        blocks.Should().ContainSingle("Dtl 占 4 个寄存器，104 处紧邻它");
+        blocks[0].Length.Should().Be(5, "4（Dtl）+ 1（String）");
+    }
+
+    [Fact]
+    public void 未定义的数据类型抛异常且消息点名该点与类型()
+    {
+        // RegisterWidth 的 `_ =>` 分支：某点的 DataType 是未定义枚举值时。
+        // 旧实现报 ParamName="point"（PlanForModbus 没有这个形参，调用方按它定位会扑空）
+        // 且消息里只有类型名、没有点的标识。现在两者都修好了。
+        var bogus = Point(9, 100) with { DataType = (PointDataType)9999 };
+
+        var act = () => ReadBlockPlanner.PlanForModbus(new[] { bogus }, mergeWindowRegisters: 16, maxRegistersPerRequest: 120);
+
+        act.Should().Throw<ArgumentOutOfRangeException>()
+            .WithParameterName("points", "PlanForModbus 的形参是 points；旧的 nameof(point) 指不到任何形参")
+            .WithMessage("*p9*", "必须点名是哪个点")
+            .WithMessage("*点9*", "必须点名是哪个点（显示名）")
+            .WithMessage("*9999*", "必须报出那个未定义的类型值");
     }
 
     [Fact]
@@ -395,7 +454,124 @@ public class ReadBlockPlannerTests
         var act = () => ReadBlockPlanner.PlanForModbus(Lazy(), mergeWindowRegisters: 16, maxRegistersPerRequest: 2);
 
         act.Should().Throw<ArgumentOutOfRangeException>();
-        enumerated.Should().Be(1, "只需枚举到第一个违规点即可失败，不应把整份点集读完");
+        // 实测为 1（不是 2）：违规点是第一个元素，foreach 取到它、进入循环体、立刻抛出，
+        // 抛出前不会再调用一次 MoveNext。故"枚举次数 == 1"恰好证明了 fail-fast——
+        // 只从迭代器取出了必要的那一个元素。若将来有人把校验搬到物化之后（先读完再报），
+        // 这个数会变成 1（多元素序列时才变大）。故这里刻意只放一个点、再配下面
+        // "单遍序列中违规点仍然立刻抛异常" 用 YieldedCount 断言的**多元素**版本一起锁死。
+        enumerated.Should().Be(1, "只从迭代器取出必要的那一个元素，不得把整份点集读完");
+    }
+
+    // ===== 点集只能被走一遍（单遍序列）=====
+    // 审查者指出：参数校验之后 `EnsureNoPointExceedsRegisterLimit(points, …)` 先把 points
+    // 完整枚举一遍，随后 Where/OrderBy/ThenBy/ToList 再枚举一遍 → **单遍序列第二遍为空**
+    // → ordered.Count == 0 → 返回空计划，采集器静默地一个点都不读且不报错。
+    // 控制者当时未能用 yield 生成器复现（yield 每次 GetEnumerator 都能重新产出，其实是多遍的），
+    // 故只作为防御性要求。**我构造出了真正单遍的序列并复现了它**（见下面 SinglePassSequence：
+    // 只有第一次 GetEnumerator 产出元素，之后一律产出空），修复前实测：
+    //   GetEnumerator 调用 2 次、blocks=0、planned=0、无任何异常。
+    // 修复后校验与物化合并为同一趟，故下面两条用例锁定该性质。
+
+    [Fact]
+    public void 单遍序列也能得到完整计划而不是静默空计划()
+    {
+        // 这是修复前会**静默失败**的路径：返回空计划而不抛异常。
+        // 用真正单遍的序列（对应 DbDataReader 支撑的 IEnumerable：一个 reader 只能走一遍）。
+        var singlePass = new SinglePassSequence([Point(1, 100), Point(2, 101), Point(3, 102)]);
+
+        var blocks = ReadBlockPlanner.PlanForModbus(singlePass, mergeWindowRegisters: 16, maxRegistersPerRequest: 120);
+
+        singlePass.EnumeratorCalls.Should().Be(1, "点集必须只被枚举一趟");
+        blocks.Should().ContainSingle();
+        blocks[0].Points.Should().HaveCount(3, "三个点都必须进入计划");
+        blocks[0].Length.Should().Be(3);
+    }
+
+    [Fact]
+    public void 点集只被枚举一趟()
+    {
+        // 上一条用"单遍序列"证明行为；这条用计数序列直接断言枚举次数。
+        // 二者互补：计数序列即使被枚举两遍也仍能出正确计划（因为它是多遍的），
+        // 所以只有它**测不出**静默空计划；只有单遍序列**说不出**到底走了几遍。
+        var counting = new CountingSequence([Point(1, 100), Point(2, 101)]);
+
+        var blocks = ReadBlockPlanner.PlanForModbus(counting, mergeWindowRegisters: 16, maxRegistersPerRequest: 120);
+
+        counting.EnumeratorCalls.Should().Be(1);
+        blocks.Should().ContainSingle();
+    }
+
+    [Fact]
+    public void 单遍序列在参数非法时仍然零枚举()
+    {
+        // 合并成一趟之后，原有的"参数校验先于枚举"性质必须保持。
+        var singlePass = new SinglePassSequence([Point(1, 100)]);
+
+        var act = () => ReadBlockPlanner.PlanForModbus(singlePass, mergeWindowRegisters: 0, maxRegistersPerRequest: 120);
+
+        act.Should().Throw<ArgumentOutOfRangeException>();
+        singlePass.EnumeratorCalls.Should().Be(0);
+    }
+
+    [Fact]
+    public void 单遍序列中违规点仍然立刻抛异常()
+    {
+        // "合并成一趟"不得把 fail-fast 变成"读完再报"。
+        var singlePass = new SinglePassSequence(
+        [
+            Point(1, 100, PointDataType.Word),
+            Point(2, 200, PointDataType.LReal),
+            Point(3, 300, PointDataType.Word),
+        ]);
+
+        var act = () => ReadBlockPlanner.PlanForModbus(singlePass, mergeWindowRegisters: 16, maxRegistersPerRequest: 2);
+
+        act.Should().Throw<ArgumentOutOfRangeException>().WithMessage("*p2*");
+        singlePass.YieldedCount.Should().Be(2, "只应取到第二个（违规）点就抛，第三个点不该被读");
+    }
+
+    /// <summary>
+    /// 真正只能走一遍的序列：**首次** <see cref="GetEnumerator"/> 产出全部元素，之后一律产出空。
+    /// 这正是"DbDataReader 支撑的 IEnumerable"的形状——reader 走完一遍就到底了。
+    /// 用它才能复现"先校验一趟、再物化一趟"导致的静默空计划；普通 yield 生成器复现不了，
+    /// 因为它每次 GetEnumerator 都会从头重新产出（其实是多遍的）。
+    /// </summary>
+    private sealed class SinglePassSequence(IReadOnlyList<PointConfig> items) : IEnumerable<PointConfig>
+    {
+        public int EnumeratorCalls { get; private set; }
+
+        public int YieldedCount { get; private set; }
+
+        public IEnumerator<PointConfig> GetEnumerator()
+        {
+            EnumeratorCalls++;
+            return EnumeratorCalls == 1 ? Walk() : Enumerable.Empty<PointConfig>().GetEnumerator();
+
+            IEnumerator<PointConfig> Walk()
+            {
+                foreach (var item in items)
+                {
+                    YieldedCount++;
+                    yield return item;
+                }
+            }
+        }
+
+        IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+    }
+
+    /// <summary>多遍序列，只统计被枚举了几趟。</summary>
+    private sealed class CountingSequence(IReadOnlyList<PointConfig> items) : IEnumerable<PointConfig>
+    {
+        public int EnumeratorCalls { get; private set; }
+
+        public IEnumerator<PointConfig> GetEnumerator()
+        {
+            EnumeratorCalls++;
+            return items.GetEnumerator();
+        }
+
+        IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
     }
 
     [Fact]

@@ -47,7 +47,15 @@ public static class ByteDecoder
 
         var width = ByteWidth(type);
 
-        if (byteOffset < 0 || byteOffset + width > buffer.Length)
+        // ⚠️ 这里必须用**减法形式**，不能写成 `byteOffset + width > buffer.Length`。
+        // 加法会在 byteOffset 接近 int.MaxValue 时回绕为负，使两个条件同时为假 →
+        // 守卫被整条绕过，随后 Span.Slice 抛出 ArgumentOutOfRangeException，
+        // 违反本方法"缓冲区不足返回 null、绝不抛越界异常"的契约。
+        // 实测（修复前）：offset=2147483647 → <ArgumentOutOfRangeException>；
+        // offset=2147483643 → null（正是 4 + 2147483643 == int.MinValue 的回绕边界）。
+        // 减法不会溢出：byteOffset < 0 已被第一个条件挡掉，故 buffer.Length - byteOffset
+        // 之后的每个操作数都在 int 范围内。
+        if (byteOffset < 0 || width > buffer.Length - byteOffset)
         {
             return null;
         }

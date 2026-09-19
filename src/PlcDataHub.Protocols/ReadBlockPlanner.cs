@@ -25,13 +25,25 @@ public static class ReadBlockPlanner
     /// </para>
     /// </param>
     /// <param name="mergeWindowRegisters">
-    /// 合并窗口：相邻地址的间隔不超过该值就合并（留空洞换取更少请求）。
+    /// 合并窗口：相邻地址的空档不超过该值就合并（留空洞换取更少请求）。
+    /// <para>
+    /// ⚠️ **先分清两个容易混的量（本项目已因此写错过一次期望）**：
+    /// <list type="bullet">
+    ///   <item><b>地址差 D</b> = <c>下一个点的 RegisterAddress − 上一个点的 RegisterAddress</c>。
+    ///         例如寄存器 100 与 116 → D = 16。</item>
+    ///   <item><b>空档 G</b> = <c>下一个点的 RegisterAddress − blockEnd</c>，
+    ///         其中 blockEnd = 上一个点的地址 + 它的寄存器宽度，即"上一个点之后第一个未被占用的寄存器"。
+    ///         例如 100 处是一个 WORD（宽 1）→ blockEnd = 101，下一个点在 116 → G = 15。</item>
+    /// </list>
+    /// **判据用的是 G**（见 <c>pointStart - blockEnd &lt; mergeWindowRegisters</c>），
+    /// 而"间隔"这个中文词在口头讨论里常被理解成 D。两者差一个"上一个点的宽度"。
+    /// </para>
     /// <para>
     /// ⚠️ **实测边界（务必按实测理解，不要按参数名的字面含义理解）**：窗口 = 16 时，
-    /// **间隔 0..15 合并、间隔 16 及以上拆分**。成因是 <c>pointStart - blockEnd &lt; mergeWindowRegisters</c>
-    /// 用的是严格小于，而 blockEnd 指向"上一个点之后第一个未被占用的寄存器"，
-    /// 故可容忍的间隔恰为 <c>0 .. 窗口-1</c>。即"窗口 16"的实际含义是"间隔不超过 15"，
-    /// 比参数名暗示的窄一格。三条用例（间隔 15 合并 / 间隔 16 合并 / 间隔 17 拆分）钉死了它。
+    /// **空档 G ∈ 0..15 合并、G ≥ 16 拆分**。成因是判定用的是严格小于，
+    /// 故可容忍的空档恰为 <c>0 .. 窗口-1</c>。即"窗口 16"的实际含义是"空档不超过 15"，
+    /// 比参数名暗示的窄一格。三条用例（G=15 合并 / D=16（即 G=15）合并 / G≥16 拆分）钉死了它。
+    /// **改这段代码前请先读这三条用例**——本边界极易被当成 off-by-one 的 bug 而"修"反。
     /// </para>
     /// </param>
     /// <param name="maxRegistersPerRequest">单次请求的寄存器数上限</param>
@@ -73,12 +85,37 @@ public static class ReadBlockPlanner
             throw new ArgumentOutOfRangeException(nameof(maxRegistersPerRequest), "单次请求上限必须至少为 1");
         }
 
-        // 先把"单个点就超限"这一配置期错误挡掉，再进入排队与分块。
-        // 校验必须与规划用同一套过滤（只看有 Modbus 地址的点），否则会出现
-        // "因为一个根本不会被规划的点而整组失败"的假失败。
-        EnsureNoPointExceedsRegisterLimit(points, maxRegistersPerRequest);
+        // 校验与物化必须在**同一趟**里完成，原因不是性能而是正确性：
+        // points 的静态类型是 IEnumerable，调用方可以传真正的一次性序列
+        // （DbDataReader 支撑的枚举、保证只可走一遍的生成器）。先校验一趟、再 Where/OrderBy
+        // 一趟的话，第二趟会拿到空序列 → ordered.Count == 0 → **返回空计划，一个点都不读且不报错**。
+        // 实测（修复前）：一个"首次 GetEnumerator 产出、之后产出空"的序列
+        // → GetEnumerator 调用 2 次、blocks=0、planned=0，无任何异常。
+        // 下面这趟循环同时保持三条既有性质：
+        //   ① 参数错误（窗口/上限 < 1）仍在枚举之前抛出；
+        //   ② 违规点**立刻**抛出（fail fast，不读完点集）；
+        //   ③ 无 Modbus 地址的点不参与上限校验（避免整组假失败）。
+        var materialized = new List<PointConfig>();
 
-        var ordered = points
+        foreach (var point in points)
+        {
+            if (point.Modbus is not null && RegisterWidth(point) > maxRegistersPerRequest)
+            {
+                var width = RegisterWidth(point);
+                throw new ArgumentOutOfRangeException(
+                    nameof(maxRegistersPerRequest),
+                    maxRegistersPerRequest,
+                    $"单次请求上限 {maxRegistersPerRequest} 个寄存器，小于采集点 {point.PointCode}（{point.PointName}）"
+                    + $" 的数据类型 {point.DataType} 所需的 {width} 个寄存器。"
+                    + "单个点必须在同一次响应里完整读回、无法拆到两次请求，故此配置必然发出超限请求。"
+                    + $"请把上限提高到至少 {width}，或把该点改为占用寄存器更少的数据类型。");
+            }
+
+            materialized.Add(point);
+        }
+
+        // 以下一律基于 materialized，绝不再触碰 points。
+        var ordered = materialized
             .Where(p => p.Modbus is not null)
             .OrderBy(p => p.Modbus!.RegisterAddress)
             .ThenBy(p => p.PointId)
@@ -125,48 +162,15 @@ public static class ReadBlockPlanner
     }
 
     /// <summary>
-    /// 拦住"单个点的寄存器宽度就超过单请求上限"的配置。
+    /// 某个点占用多少个 Modbus 寄存器（16 位）。
     /// </summary>
-    /// <remarks>
-    /// **为什么是 <see cref="ArgumentOutOfRangeException"/> 而不是 <see cref="InvalidOperationException"/>：**
-    /// <list type="bullet">
-    ///   <item>本例里**唯一出问题的参数值就是 <paramref name="maxRegistersPerRequest"/>**：
-    ///         那些点本身完全合法（一个 LREAL 点在任何"上限 ≥ 4"的配置下都合法），
-    ///         换一个更大的上限就立刻可用。故把参数名与实参带上，排障时一眼看到该改哪个数。
-    ///         这与"对象当前状态不允许该操作"（InvalidOperationException）的语义不同——
-    ///         这里没有状态，只有参数与输入不匹配。</item>
-    ///   <item>本方法已有的参数校验（窗口/上限小于 1）都用 <see cref="ArgumentOutOfRangeException"/>，
-    ///         保持调用方 catch 同一种异常即可覆盖全部参数问题。</item>
-    ///   <item>把出问题的点写进异常消息（而不是只报 <c>maxRegistersPerRequest=2</c>），
-    ///         因为"上限该设多大"取决于配置里最宽的那个点，而调用方从参数值本身看不出来。</item>
-    /// </list>
-    /// </remarks>
-    private static void EnsureNoPointExceedsRegisterLimit(
-        IEnumerable<PointConfig> points,
-        int maxRegistersPerRequest)
-    {
-        foreach (var point in points)
-        {
-            // 不参与规划的点（Modbus 地址为 null）不校验，与 PlanForModbus 的过滤保持一致；
-            // 否则会出现"因为一个根本不会被规划的点而整组失败"的假失败。
-            // 用单表达式条件而非 if+continue：把这段判定写成独立语句时，
-            // 任何"跳过校验"的变异都会立刻触发 CS0162（无法检测的代码）——那只能证明编译器在工作，
-            // 拿不到"断言失败"的合格证据。写成条件表达式后，同一变异产生可观测的行为差异。
-            if (point.Modbus is not null && RegisterWidth(point) > maxRegistersPerRequest)
-            {
-                var width = RegisterWidth(point);
-                throw new ArgumentOutOfRangeException(
-                    nameof(maxRegistersPerRequest),
-                    maxRegistersPerRequest,
-                    $"单次请求上限 {maxRegistersPerRequest} 个寄存器，小于采集点 {point.PointCode}（{point.PointName}）"
-                    + $" 的数据类型 {point.DataType} 所需的 {width} 个寄存器。"
-                    + "单个点必须在同一次响应里完整读回、无法拆到两次请求，故此配置必然发出超限请求。"
-                    + $"请把上限提高到至少 {width}，或把该点改为占用寄存器更少的数据类型。");
-            }
-        }
-    }
-
-    /// <summary>某个点占用多少个 Modbus 寄存器（16 位）。</summary>
+    /// <param name="point">
+    /// ⚠️ 注意异常里的 <c>ParamName</c>：这里以前写的是 <c>nameof(point)</c>，而 **<see cref="PlanForModbus"/>
+    /// 的形参里没有 <c>point</c>**（只有 points / mergeWindowRegisters / maxRegistersPerRequest），
+    /// 于是调用方按 ParamName 去定位参数时会扑空；同时旧消息也不含点的标识，
+    /// 使得"某个点的 DataType 是未定义枚举值"这条路径报出来的异常**既指不到参数也指不到点**。
+    /// 现在改为 "points"（见下方 switch 的说明：静态方法里取不到该形参，故用字面量）+ 消息里带上点的标识。
+    /// </param>
     internal static int RegisterWidth(PointConfig point) => point.DataType switch
     {
         PointDataType.Bool => 1,
@@ -181,8 +185,21 @@ public static class ReadBlockPlanner
         PointDataType.UDInt => 2,
         PointDataType.Real => 2,
         PointDataType.LReal => 4,
-        PointDataType.Dtl => 4,
-        PointDataType.String => 1,   // Modbus 字符串按字节流处理，具体宽度由地址与长度决定
-        _ => throw new ArgumentOutOfRangeException(nameof(point), point.DataType, "未知数据类型"),
+        PointDataType.Dtl => 4,      // S7 DATE_AND_TIME 占 8 字节 = 4 个寄存器（解码层本期不支持，见 ByteDecoder）
+        PointDataType.String => 1,   // 占位值：Modbus 字符串按字节流处理，真实宽度需地址表配置，PointConfig 无长度字段
+        // ParamName 用字面量 "points" 而不是 nameof(points)：本方法是静态的、
+        // 参数表里没有 points，nameof 在这里取不到该形参（已实测报 CS0103）。
+        // 之所以仍报 "points"：调用方唯一能传点集进来的入口就是 PlanForModbus 的 points 形参，
+        // 而 RegisterWidth 只在处理这些点时被调用（唯一例外是 ByteDecoder 侧的宽度概念，与参数无关）。
+        _ => throw new ArgumentOutOfRangeException("points", point.DataType, UnknownDataTypeMessage(point)),
     };
+
+    /// <summary>
+    /// "未知数据类型"的错误消息。必须点名**是哪个点**的什么类型：
+    /// 该分支只在某个点的 DataType 是未定义枚举值时触发，而调用方拿到异常后要定位到具体点，
+    /// 只报类型名（例如 "9999"）在几百个点的配置里没有任何指向性。
+    /// </summary>
+    private static string UnknownDataTypeMessage(PointConfig point) =>
+        $"采集点 {point.PointCode}（{point.PointName}）的数据类型 {point.DataType} 不是已定义的 {nameof(PointDataType)} 值，" +
+        "无法确定它占用多少个 Modbus 寄存器。请检查该点的数据类型配置。";
 }

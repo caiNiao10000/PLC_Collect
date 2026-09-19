@@ -74,7 +74,12 @@ public class ByteDecoderTests
     [InlineData(new byte[] { 0xFF, 0xFF, 0xFF, 0xFF }, PointDataType.DWord, 4294967295.0)]  // DWord 上位
     [InlineData(new byte[] { 0x80, 0x00, 0x00, 0x00 }, PointDataType.DWord, 2147483648.0)]
     [InlineData(new byte[] { 0x00, 0x00, 0x64, 0x00 }, PointDataType.UDInt, 25600.0)]
-    [InlineData(new byte[] { 0xFF, 0xFF, 0xFF, 0xFF }, PointDataType.DInt, -1.0)]           // DInt = -1，与 DWord 的 4294967295 必须区分开
+    // UDInt 的**区分符号**探针：0x00006400 在有符号/无符号下同为 25600，不足以证明
+    // UDInt 走的是无符号分支（把 UDInt 改成 DecodeInt32 时它不会红）。
+    // 下面这条 0xFFFFFFFF 在无符号下是 4294967295、在有符号下是 -1，才真正把分支钉住。
+    [InlineData(new byte[] { 0xFF, 0xFF, 0xFF, 0xFF }, PointDataType.UDInt, 4294967295.0)]
+    [InlineData(new byte[] { 0x80, 0x00, 0x00, 0x00 }, PointDataType.UDInt, 2147483648.0)]
+    [InlineData(new byte[] { 0xFF, 0xFF, 0xFF, 0xFF }, PointDataType.DInt, -1.0)]           // DInt = -1，与 DWord/UDInt 的 4294967295 必须区分开
     [InlineData(new byte[] { 0x80, 0x00, 0x00, 0x00 }, PointDataType.DInt, -2147483648.0)]  // DInt 下界 = int.MinValue
     [InlineData(new byte[] { 0x7F, 0xFF, 0xFF, 0xFF }, PointDataType.DInt, 2147483647.0)]   // DInt 上界
     [InlineData(new byte[] { 0xFF, 0xFF, 0xFF, 0x9C }, PointDataType.DInt, -100.0)]
@@ -124,6 +129,50 @@ public class ByteDecoderTests
         byte[] buffer = [0x41, 0xCC, 0x00, 0x00];
 
         ByteDecoder.DecodeNumeric(buffer, -1, PointDataType.Real, ByteOrder.Big).Should().BeNull();
+    }
+
+    // ===== 整数溢出带：长度检查必须用减法形式，加法形式会被回绕绕过 =====
+    // 实测（修复前，加法形式 `byteOffset + width > buffer.Length`）：
+    //   offset=10          → null    ✓
+    //   offset=-1          → null    ✓
+    //   offset=2147483643  → null    ✓（4 + 2147483643 == int.MinValue，回绕边界）
+    //   offset=2147483644  → <ArgumentOutOfRangeException>  ⚠️ 违反契约
+    //   offset=2147483647  → <ArgumentOutOfRangeException>  ⚠️ 违反契约
+    // 后果是抛异常而不是错值（Span.Slice 自身用无溢出算术校验），但它**证伪了本方法
+    // "缓冲区不足返回 null、绝不抛越界异常"的契约**。调用方（采集器的坏点处理）按契约
+    // 预期"越界 = 本轮坏点、下轮再试"，拿到异常就是采集中断——而溢出恰恰来自调用方偏移算错，
+    // 那正是最该被降级成"坏点"的场景。
+
+    [Theory]
+    [InlineData(int.MaxValue)]                          // 必然回绕
+    [InlineData(int.MaxValue - 1)]                      // 必然回绕
+    [InlineData(int.MaxValue - 3)]                      // 恰好是"4 + x == int.MinValue"的回绕边界
+    [InlineData(int.MaxValue - 4)]                      // 边界外侧一格：减法形式下仍必须为 null，不是 0 长度成功
+    [InlineData(int.MaxValue - 100)]
+    public void 极大正偏移返回_null_而不抛异常(int byteOffset)
+    {
+        byte[] buffer = [0x41, 0xCC, 0x00, 0x00];
+
+        var act = () => ByteDecoder.DecodeNumeric(buffer, byteOffset, PointDataType.Real, ByteOrder.Big);
+
+        act.Should().NotThrow("本方法承诺'缓冲区不足返回 null、绝不抛越界异常'，溢出带也不例外");
+        act().Should().BeNull("极大偏移必然越界，只能是坏点");
+    }
+
+    [Theory]
+    [InlineData(int.MaxValue, PointDataType.Word)]      // width 2
+    [InlineData(int.MaxValue - 1, PointDataType.Byte)]  // width 1
+    [InlineData(int.MaxValue, PointDataType.LReal)]     // width 8
+    public void 极大正偏移对任意宽度都返回_null(int byteOffset, PointDataType type)
+    {
+        // 溢出边界随 width 移动（回绕点是 width + offset == int.MinValue），
+        // 故必须覆盖多种宽度，不能只用 width=4 的 Real。
+        byte[] buffer = new byte[8];
+
+        var act = () => ByteDecoder.DecodeNumeric(buffer, byteOffset, type, ByteOrder.Big);
+
+        act.Should().NotThrow();
+        act().Should().BeNull();
     }
 
     [Theory]
