@@ -22,14 +22,14 @@ public class MigrationPlannerTests
         plan.IsEmpty.Should().BeFalse();
         plan.Steps.Should().ContainSingle(s => s.Kind == MigrationStepKind.CreateTable);
         plan.Steps.Single(s => s.Kind == MigrationStepKind.CreateTable).Sql
-            .Should().Contain("create table if not exists d.plc01_fast")
+            .Should().Contain("create table if not exists d.\"plc01_fast\"")
             .And.Contain("\"ts\" timestamp not null")
             .And.Contain("\"wen_du\" double precision null");
         plan.Steps.Should().ContainSingle(s => s.Kind == MigrationStepKind.CreateIndex);
     }
 
     /// <summary>
-    /// 跨任务约束 3：规格 3.4 节要求 <c>q smallint not null default 0</c>，而
+    /// 跨任务约束 3：规格 3.4 节要求质量列带 <c>default 0</c>，而
     /// <see cref="DesiredColumn"/> 只表达 <c>(Name, PostgresType, IsNullable)</c>、
     /// **无法表达默认值**，故必须由建表 SQL 侧硬编码。
     /// 断言用 <c>Contain</c> 而不是全串相等：本用例要锁的是"质量列带 default 0"，
@@ -43,11 +43,39 @@ public class MigrationPlannerTests
         var create = MigrationPlanner.Plan(desired, Array.Empty<ExistingTable>(), SafeOptions)
             .Steps.Single(s => s.Kind == MigrationStepKind.CreateTable).Sql;
 
-        create.Should().Contain("\"q\" smallint not null default 0");
+        create.Should().Contain("\"q\" smallint default 0 not null");
 
-        // 反向：default 0 只能出现在质量列那一段，不能漏到别的列上
+        // 反向：default 只能出现在质量列那一段，不能漏到别的列上
         create.Split(",\n").Should().ContainSingle(line => line.Contains("default", StringComparison.Ordinal))
             .Which.Should().Contain("\"q\"");
+    }
+
+    /// <summary>
+    /// 质量列的大小写不影响 <c>default 0</c>。
+    /// <para>
+    /// 这条是 M3 要求的"会红的断言"：<c>default 0</c> 此前靠"列名恰为小写 <c>q</c>"的名字约定触发，
+    /// 而 <c>MigrationPlanner</c> 是 public API —— 跨任务不变量不能靠名字约定静默维持。
+    /// <see cref="DesiredSchemaBuilder"/> 的大小写不敏感去重守卫保证**任何拼写的质量列都只可能有一个**
+    /// （手工名写 <c>Q</c> 会与固定列 <c>q</c> 相撞并抛错），故按 <c>OrdinalIgnoreCase</c> 判定是安全的，
+    /// 且能保证换拼写时不会**静默漏掉**默认值。
+    /// </para>
+    /// <para>
+    /// ⚠️ 本任务**不检查已存在表的 <c>q</c> 是否真的带默认值** —— 合同里
+    /// <see cref="ExistingColumn"/> 只有 <c>(Name, PostgresType)</c>，不承载默认值，
+    /// 属 Plan 2 的接口限制，登记备查。
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData("q")]
+    [InlineData("Q")]
+    public void 质量列两种大小写拼写都带_default_0(string qualityColumnName)
+    {
+        var desired = Table("plc01_fast", ("ts", "timestamp"), (qualityColumnName, "smallint"));
+
+        var create = MigrationPlanner.Plan(desired, Array.Empty<ExistingTable>(), SafeOptions)
+            .Steps.Single(s => s.Kind == MigrationStepKind.CreateTable).Sql;
+
+        create.Should().Contain($"\"{qualityColumnName}\" smallint default 0 not null");
     }
 
     [Fact]
@@ -57,16 +85,63 @@ public class MigrationPlannerTests
 
         var plan = MigrationPlanner.Plan(desired, Array.Empty<ExistingTable>(), SafeOptions);
 
-        // 实测形态：create table if not exists d.plc01_fast (\n  "ts" …,\n  "q" …,\n  "src_ts" …,\n  "wen_du" …\n)
+        // 实测形态（表名与索引名一律加双引号；default 0 在可空性之前）
         plan.Steps.Single(s => s.Kind == MigrationStepKind.CreateTable).Sql.Should().Be(
-            "create table if not exists d.plc01_fast (\n" +
+            "create table if not exists d.\"plc01_fast\" (\n" +
             "  \"ts\" timestamp not null,\n" +
-            "  \"q\" smallint not null default 0,\n" +
+            "  \"q\" smallint default 0 not null,\n" +
             "  \"src_ts\" timestamp null,\n" +
             "  \"wen_du\" double precision null\n" +
             ")");
         plan.Steps.Single(s => s.Kind == MigrationStepKind.CreateIndex).Sql.Should().Be(
-            "create index if not exists plc01_fast_ts_idx on d.plc01_fast (ts)");
+            "create index if not exists \"plc01_fast_ts_idx\" on d.\"plc01_fast\" (ts)");
+    }
+
+    /// <summary>
+    /// 时间索引名也受 PostgreSQL 标识符的 63 **字节**上限约束，必须自己拦。
+    /// <para>
+    /// 索引名 = 表名 + 7 字节后缀 <c>_ts_idx</c> + **2 字节引号**，故表名上限是
+    /// <c>63 - 7 - 2 = 54</c> 字节。PG 对超长标识符是**静默截断**而非报错：
+    /// 同 schema 下两张共享长前缀的表会截断成同一个索引名，
+    /// 第二张表的 <c>create index if not exists</c> 变成静默 no-op —— **漏索引且无报错**。
+    /// 与 Task 4 的 <c>GuardColumns</c> 一样选择"响亮拒绝"而不是"静默截断"。
+    /// </para>
+    /// <para>
+    /// ⚠️ 引号**计入**字节数是实测确认的：我第一版按 <c>63 - 7 = 56</c> 算上限，
+    /// 实测 56 字节表名产出 **65** 字节索引名，正是被探针打印真实值查出来的。
+    /// 故边界锁在 54/55 两侧。
+    /// </para>
+    /// <para>
+    /// 本用例是补的覆盖缺口：加它之前，把这段守卫整个关掉**没有任何测试会红**
+    /// （变异 M7 实测 DISTINCT_RED=0）。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void 索引名恰好_63_字节时通过()
+    {
+        // 54 字节表名 → "table_ts_idx" 含引号恰好 63 字节
+        var tableName = new string('t', 54);
+        var desired = Table(tableName, ("ts", "timestamp"), ("q", "smallint"));
+
+        var sql = MigrationPlanner.Plan(desired, Array.Empty<ExistingTable>(), SafeOptions)
+            .Steps.Single(s => s.Kind == MigrationStepKind.CreateIndex).Sql;
+
+        var indexName = tableName + "_ts_idx";
+        sql.Should().Be($"create index if not exists \"{indexName}\" on d.\"{tableName}\" (ts)");
+        System.Text.Encoding.UTF8.GetByteCount($"\"{indexName}\"").Should().Be(63);
+    }
+
+    /// <summary>与上一条配对：表名多 1 字节（55）时索引名 64 字节，必须响亮拒绝。</summary>
+    [Fact]
+    public void 索引名超过_63_字节时被拒绝()
+    {
+        var tableName = new string('t', 55);
+        var desired = Table(tableName, ("ts", "timestamp"), ("q", "smallint"));
+
+        var message = Assert.Throws<InvalidOperationException>(
+            () => MigrationPlanner.Plan(desired, Array.Empty<ExistingTable>(), SafeOptions)).Message;
+
+        message.Should().Contain("索引名").And.Contain("64").And.Contain("63").And.Contain("54");
     }
 
     /// <summary>
@@ -99,7 +174,7 @@ public class MigrationPlannerTests
 
         plan.Steps.Should().ContainSingle(s => s.Kind == MigrationStepKind.AddColumn);
         plan.Steps.Single(s => s.Kind == MigrationStepKind.AddColumn).Sql
-            .Should().Be("alter table d.plc01_fast add column if not exists \"ya_li\" double precision null");
+            .Should().Be("alter table d.\"plc01_fast\" add column if not exists \"ya_li\" double precision null");
         plan.DestructiveSteps.Should().BeEmpty();
     }
 
@@ -114,8 +189,8 @@ public class MigrationPlannerTests
         var plan = MigrationPlanner.Plan(desired, new[] { existing }, SafeOptions);
 
         plan.Steps.Where(s => s.Kind == MigrationStepKind.AddColumn).Select(s => s.Sql).Should().Equal(
-            "alter table d.plc01_fast add column if not exists \"q\" smallint not null default 0",
-            "alter table d.plc01_fast add column if not exists \"src_ts\" timestamp null");
+            "alter table d.\"plc01_fast\" add column if not exists \"q\" smallint default 0 not null",
+            "alter table d.\"plc01_fast\" add column if not exists \"src_ts\" timestamp null");
     }
 
     // ──────────────────── 列名比对：大小写不敏感 ────────────────────
@@ -192,7 +267,7 @@ public class MigrationPlannerTests
         plan.Steps.Should().ContainSingle(s => s.Kind == MigrationStepKind.SoftDeleteColumn);
         plan.Steps.Should().NotContain(s => s.Kind == MigrationStepKind.DropColumn);
         plan.Steps.Single(s => s.Kind == MigrationStepKind.SoftDeleteColumn).Sql
-            .Should().StartWith("alter table d.plc01_fast rename column \"jiu_dian\" to \"deleted_jiu_dian_");
+            .Should().StartWith("alter table d.\"plc01_fast\" rename column \"jiu_dian\" to \"deleted_jiu_dian_");
     }
 
     [Fact]
@@ -205,7 +280,7 @@ public class MigrationPlannerTests
             .Steps.Single(s => s.Kind == MigrationStepKind.SoftDeleteColumn).Sql;
 
         sql.Should().Be(
-            $"alter table d.plc01_fast rename column \"jiu_dian\" to \"deleted_jiu_dian_{DateTime.Now:yyyyMMdd}\"");
+            $"alter table d.\"plc01_fast\" rename column \"jiu_dian\" to \"deleted_jiu_dian_{DateTime.Now:yyyyMMdd}\"");
     }
 
     [Fact]
@@ -232,7 +307,7 @@ public class MigrationPlannerTests
 
         var drop = plan.Steps.Should().ContainSingle(s => s.Kind == MigrationStepKind.DropColumn).Subject;
         drop.IsDestructive.Should().BeTrue();
-        drop.Sql.Should().Be("alter table d.plc01_fast drop column \"jiu_dian\"");
+        drop.Sql.Should().Be("alter table d.\"plc01_fast\" drop column \"jiu_dian\"");
         drop.Description.Should().Contain("丢弃");   // 破坏性操作必须写清后果
     }
 
@@ -312,7 +387,7 @@ public class MigrationPlannerTests
         var message = Assert.Throws<MigrationConflictException>(
             () => MigrationPlanner.Plan(desired, new[] { existing }, SafeOptions)).Message;
 
-        message.Should().Contain("d.plc01_fast").And.Contain("不会自动修改列类型")
+        message.Should().Contain("d.\"plc01_fast\"").And.Contain("不会自动修改列类型")
             .And.Contain("新建一列").And.Contain("确认丢弃该列数据后重建");
     }
 
@@ -394,7 +469,7 @@ public class MigrationPlannerTests
         var plan = MigrationPlanner.Plan(desired, new[] { before }, SafeOptions);
 
         plan.Steps.Where(s => s.Kind == MigrationStepKind.AddColumn).Select(s => s.Sql).Should().Equal(
-            "alter table d.plc01_fast add column if not exists \"ya_li\" double precision null");
+            "alter table d.\"plc01_fast\" add column if not exists \"ya_li\" double precision null");
         var rename = plan.Steps.Should().ContainSingle(s => s.Kind == MigrationStepKind.SoftDeleteColumn).Subject;
         var renamed = rename.Sql[(rename.Sql.IndexOf(" to \"", StringComparison.Ordinal) + 5)..].TrimEnd('"');
 
@@ -489,8 +564,8 @@ public class MigrationPlannerTests
         var drop = MigrationPlanner.Plan(desired, new[] { existing }, new MigrationOptions(DropRemovedTables: true))
             .Steps.Single(s => s.Kind == MigrationStepKind.DropTable);
 
-        drop.Sql.Should().Be("drop table d.plc01_fast");
-        drop.Description.Should().Contain("d.plc01_fast").And.Contain("86,400");
+        drop.Sql.Should().Be("drop table d.\"plc01_fast\"");
+        drop.Description.Should().Contain("d.\"plc01_fast\"").And.Contain("86,400");
     }
 
     [Fact]
@@ -540,9 +615,15 @@ public class MigrationPlannerTests
     }
 
     /// <summary>
-    /// 反向对照：约束 4 只要求拦"非 ASCII"与"内嵌引号"，**不是**"白名单只许 [a-z0-9_]"。
-    /// 空格、连字符、大写字母在双引号标识符里都合法且安全，必须放行 ——
-    /// 误杀它们会让用户已有的合法表结构无法规划迁移。
+    /// 反向对照（本任务是**引号 + 非 ASCII** 两档政策，不是"白名单只许 [a-z0-9_]"）：
+    /// 列名在 DDL 里**全程有双引号包裹**，故空格、连字符、点号、<c>$</c>、大写字母
+    /// 都是 PG 允许的合法标识符字符，必须放行 —— 误杀它们会让用户已有的合法列名无法规划。
+    /// <para>
+    /// 政策边界（三条，由本文件三组用例分别锁定）：
+    /// ① 期望**列名** → 引号 + 拦非 ASCII/引号/反斜杠/控制字符（本用例 + 上面的 Theory）；
+    /// ② 期望**表名** → 额外要求白名单 <c>[A-Za-z0-9_]</c>（见"非法期望表名被拒绝"）；
+    /// ③ 数据库**现存**表名与列名 → 同 ①（第三方输入，别人建的 <c>"my-table"</c> 合法且安全）。
+    /// </para>
     /// </summary>
     [Theory]
     [InlineData("wen_du")]
@@ -552,7 +633,7 @@ public class MigrationPlannerTests
     [InlineData("wen.du")]
     [InlineData("_wen_du_")]
     [InlineData("wen$du")]
-    public void 安全的_ASCII_手工列名一律放行(string columnName)
+    public void 带引号即安全的_ASCII_列名一律放行(string columnName)
     {
         var desired = Table("plc01_fast", ("ts", "timestamp"), ("q", "smallint"), (columnName, "double precision"));
 
@@ -560,6 +641,289 @@ public class MigrationPlannerTests
 
         plan.Steps.Single(s => s.Kind == MigrationStepKind.CreateTable).Sql
             .Should().Contain($"\"{columnName}\" double precision null");
+    }
+
+    // ──────────── 表名注入面（Critical 修复的核心）────────────
+
+    /// <summary>
+    /// <b>Critical：期望表名只允许白名单 <c>[A-Za-z0-9_]</c>。</b>
+    /// <para>
+    /// 表名是唯一以**裸标识符**形式拼进 DDL 的对象。不加引号时
+    /// <c>;</c>、空格、括号、<c>-</c> 都是语法元素：实测表名
+    /// <c>x (dummy int); drop table d.other; create table d.x</c>
+    /// 会让生成的语句变成多条并删掉别的表。
+    /// 规格对 <c>conn_code</c> 有"仅 <c>[a-z0-9_]</c>"约束，而 <c>table_name</c>
+    /// 在界面上可由用户编辑、Core 内此前零校验，故这里补上。
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData("plc01 fast", "空格")]
+    [InlineData("x (dummy int); drop table d.other; create table d.x", "分号注入")]
+    [InlineData("x'", "单引号")]
+    [InlineData("x-y", "连字符")]
+    [InlineData("x(a", "左括号")]
+    [InlineData("x)b", "右括号")]
+    [InlineData("x.y", "点号（裸标识符里是 schema 分隔符）")]
+    [InlineData("x$y", "美元符")]
+    [InlineData("温du", "非 ASCII")]
+    [InlineData("x\"y", "双引号")]
+    [InlineData("", "空表名")]
+    public void 非法期望表名被拒绝(string tableName, string reason)
+    {
+        var desired = Table(tableName, ("ts", "timestamp"), ("q", "smallint"));
+
+        var act = () => MigrationPlanner.Plan(desired, Array.Empty<ExistingTable>(), SafeOptions);
+
+        act.Should().Throw<InvalidOperationException>($"{reason} 的表名不得进入 DDL")
+            .WithMessage("*表名*");
+    }
+
+    /// <summary>合法表名（含大写与下划线）必须照常工作，白名单不能误杀。</summary>
+    [Theory]
+    [InlineData("plc01_fast")]
+    [InlineData("PLC01_Fast")]
+    [InlineData("_t1")]
+    [InlineData("t999")]
+    public void 合法期望表名一律放行(string tableName)
+    {
+        var desired = Table(tableName, ("ts", "timestamp"), ("q", "smallint"));
+
+        var plan = MigrationPlanner.Plan(desired, Array.Empty<ExistingTable>(), SafeOptions);
+
+        plan.Steps.Single(s => s.Kind == MigrationStepKind.CreateTable).Sql
+            .Should().Contain($"create table if not exists d.\"{tableName}\"");
+    }
+
+    /// <summary>
+    /// <b>Critical 修复的第一道门：所有 DDL 里的表名与索引名一律加双引号。</b>
+    /// <para>
+    /// 即使配置层漏检（校验层尚不存在、<c>MigrationPlanner</c> 又是 public API），
+    /// 引号也能保证**数据库现存表名**（真正的第三方输入）不会撕裂语句。
+    /// 这里用带连字符与空格的现存表名，断言生成的 SQL 里表名**是被引号包裹的**。
+    /// </para>
+    /// <para>
+    /// ⚠️ 断言"含引号包裹形式"而不是"整串相等"：本用例要锁的是引号政策本身，
+    /// 与列内容无关。
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData("my-table")]
+    [InlineData("other table")]
+    [InlineData("weird;name")]
+    public void 现存表名始终被双引号包裹(string existingTableName)
+    {
+        // 期望里没有这张表 → 它是孤儿表 → 用 DropRemovedTables=true 逼出 drop table 语句
+        var desired = new DesiredSchema(Array.Empty<DesiredTable>());
+        var existing = Existing(existingTableName, ("ts", "timestamp"), ("q", "smallint"));
+
+        var sql = MigrationPlanner.Plan(desired, new[] { existing }, new MigrationOptions(DropRemovedTables: true))
+            .Steps.Single(s => s.Kind == MigrationStepKind.DropTable).Sql;
+
+        sql.Should().Be($"drop table d.\"{existingTableName}\"");
+    }
+
+    /// <summary>
+    /// 现存表名里的引号/非 ASCII 等仍被拦（第三方输入的基础守卫）——
+    /// 引号是"破坏引号包裹"的那个字符，必须拒绝而不是拼出 <c>"a"b"</c> 这种撕裂语句。
+    /// <para>
+    /// ⚠️ 断言**具体的消息**（<c>含需转义字符</c> / <c>含控制字符</c> / <c>非 ASCII</c>），
+    /// 而不是只断言"抛了 <see cref="InvalidOperationException"/>"：
+    /// 后者会被任何**其它原因**的异常满足，从而让测试假绿
+    /// （变异 M15 实测暴露过这个问题：把"匹配表"误当孤儿表也会抛异常，断言照样通过）。
+    /// </para>
+    /// <para>
+    /// 期望表名用**大写拼写**（<c>A"B</c> 等）是必需的：守卫只校验"会被引用的对象"，
+    /// 而两张表要靠大小写不敏感匹配上（PG 未加引号标识符折叠为小写，加引号建的
+    /// <c>"A"B"</c> 与期望的 <c>a"b</c> 在库中是同一张表）。
+    /// 若把期望写成小写 <c>a"b</c>，就会被**期望表名白名单**先拦下（那张门更严），
+    /// 本用例就测不到"现存表名"这条分支了 —— 这正是我第一版写错的地方。
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData("a\"b", "A\"B", "含需转义字符")]
+    [InlineData("a\\b", "A\\B", "含需转义字符")]
+    [InlineData("a\nb", "A\nB", "含控制字符")]
+    [InlineData("宽表", "宽表", "非 ASCII")]
+    public void 现存表名含危险字符时被拒绝(string existingTableName, string desiredTableName, string expectedMessage)
+    {
+        var desired = Table(desiredTableName, ("ts", "timestamp"), ("q", "smallint"));
+        var existing = new[] { Existing(existingTableName, ("ts", "timestamp"), ("q", "smallint")) };
+
+        var act = () => MigrationPlanner.Plan(desired, existing, SafeOptions);
+
+        act.Should().Throw<InvalidOperationException>().WithMessage($"*{expectedMessage}*");
+    }
+
+    /// <summary>
+    /// 现存**列名**的守卫要覆盖非 ASCII 分支（此前只测了引号分支，该分支零覆盖）。
+    /// 现存列名会进 rename/drop 语句。
+    /// </summary>
+    [Fact]
+    public void 现存列名含非ASCII时被拒绝()
+    {
+        var desired = Table("plc01_fast", ("ts", "timestamp"), ("q", "smallint"));
+        var existing = new[]
+        {
+            Existing("plc01_fast", ("ts", "timestamp"), ("q", "smallint"), ("温_du", "double precision")),
+        };
+
+        var message = Assert.Throws<InvalidOperationException>(
+            () => MigrationPlanner.Plan(desired, existing, SafeOptions)).Message;
+
+        message.Should().Contain("温_du").And.Contain("非 ASCII");
+    }
+
+    /// <summary>
+    /// <b>只校验真的会进 SQL 的对象。</b>
+    /// 孤儿表在默认选项（<c>DropRemovedTables=false</c>）下零产出，其列名一个字符都不进 DDL，
+    /// 故不应拦住计划 —— 库里一张配置外的遗留表只要有一列叫 <c>温_du</c>，
+    /// 用户此前会**连预览都拿不到**。这是过度守卫。
+    /// </summary>
+    [Fact]
+    public void 孤儿表的脏列名不阻止计划_默认不删表()
+    {
+        var desired = Table("plc01_fast", ("ts", "timestamp"), ("q", "smallint"));
+        var existing = new[]
+        {
+            // 会被引用的表：干净
+            Existing("plc01_fast", ("ts", "timestamp"), ("q", "smallint")),
+            // 孤儿表：列名又脏又非 ASCII，但默认选项下不会进任何 SQL
+            Existing("legacy_table", ("ts", "timestamp"), ("温_du", "double precision"), ("a\"b", "double precision")),
+        };
+
+        var plan = MigrationPlanner.Plan(desired, existing, SafeOptions);
+
+        plan.IsEmpty.Should().BeTrue("孤儿表默认零产出，其列名不该进任何 SQL，也就不该校验");
+    }
+
+    /// <summary>
+    /// 孤儿表的守卫只在 <c>DropRemovedTables=true</c> 时对**危险字符**生效。
+    /// <para>
+    /// ⚠️ 注意"危险字符"的边界（我第一版在这里写错过）：现存标识符的政策是
+    /// **只拦会破坏引号包裹的字符**（引号、反斜杠、控制字符），
+    /// 空格与非 ASCII **放行** —— 因为表名全程有双引号包裹，
+    /// <c>drop table d."legacy table"</c> 是合法且安全的 SQL。
+    /// 期望结构的表名才额外要求白名单（那张门更严，因为它是裸标识符路径 + 我们自己产出的名字）。
+    /// </para>
+    /// <para>
+    /// 断言**具体消息**而不是"抛了异常"：后者会被任何其它原因的异常满足而假绿。
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData("legacy\"table", "含需转义字符")]
+    [InlineData("legacy\\table", "含需转义字符")]
+    [InlineData("legacy\ntable", "含控制字符")]
+    public void 孤儿表会删表时危险表名被拒绝(string orphanName, string expectedMessage)
+    {
+        var desired = new DesiredSchema(Array.Empty<DesiredTable>());
+        var existing = new[] { Existing(orphanName, ("ts", "timestamp"), ("q", "smallint")) };
+
+        var act = () => MigrationPlanner.Plan(desired, existing, new MigrationOptions(DropRemovedTables: true));
+
+        act.Should().Throw<InvalidOperationException>().WithMessage($"*{expectedMessage}*");
+    }
+
+    /// <summary>
+    /// 孤儿表的表名与列名在默认选项下**完全不被校验**：
+    /// 它们一个字符都不会进 SQL。若连它们也扫，库里一张配置外的遗留表
+    /// 只要有一列叫 <c>温_du</c> 或表名带空格，用户就**连预览都拿不到**（过度守卫）。
+    /// <para>
+    /// 本用例故意用"又脏又非 ASCII"的名字，锁的就是"默认选项下不校验"这条边界。
+    /// </para>
+    /// <para>
+    /// ⚠️ 这里**必须用 <c>Assert.Null</c> 断言"不抛任何异常"，不能只断言 <c>IsEmpty</c>：
+    /// 这个 fixture 不含"会被比对"的表，故若把孤儿表误当匹配表去校验，
+    /// 该用例会以异常形式红 —— 这正是它相对其它用例的鉴别力所在。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void 孤儿表的脏表名与脏列名在默认选项下不阻止计划()
+    {
+        var desired = new DesiredSchema(Array.Empty<DesiredTable>());
+        var existing = new[]
+        {
+            Existing("legacy table", ("ts", "timestamp"), ("温_du", "double precision"), ("a\"b", "double precision")),
+        };
+
+        var plan = Record.Exception(() => MigrationPlanner.Plan(desired, existing, SafeOptions));
+
+        plan.Should().BeNull("孤儿表默认零产出，其表名与列名都不进任何 SQL，也就不该校验");
+        MigrationPlanner.Plan(desired, existing, SafeOptions).IsEmpty.Should().BeTrue();
+    }
+
+    /// <summary>孤儿表的列名在任何分支下都不进 SQL，故 DropRemovedTables=true 时也不校验列名。</summary>
+    [Fact]
+    public void 孤儿表的脏列名在删表时也不阻止计划()
+    {
+        var desired = new DesiredSchema(Array.Empty<DesiredTable>());
+        var existing = new[]
+        {
+            Existing("legacy_table", ("ts", "timestamp"), ("温_du", "double precision"), ("a\"b", "double precision")),
+        };
+
+        var plan = MigrationPlanner.Plan(desired, existing, new MigrationOptions(DropRemovedTables: true));
+
+        plan.Steps.Single(s => s.Kind == MigrationStepKind.DropTable).Sql.Should().Be("drop table d.\"legacy_table\"");
+    }
+
+    // ──────────── 大小写等价的重复：响亮失败 ────────────
+
+    /// <summary>
+    /// <b>大小写等价但拼写不同的列 → 响亮抛出</b>（不静默取先出现的一列）。
+    /// <para>
+    /// 静默合并会让同一个库状态因 information_schema 的行序不同给出两种结果：
+    /// 取到"先出现"的那列若类型不匹配就抛**假冲突**；若恰好匹配则计划为空、静默通过，
+    /// 随后写入撞上另一列的类型。而且"待删列"遍历会认为该列"在配置里"，
+    /// 于是它永远不被软删除、计划里一字不提。消息必须同时给出两个拼写。
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void 现存列仅大小写不同时抛异常并指名两个拼写()
+    {
+        var desired = Table("plc01_fast", ("ts", "timestamp"), ("q", "smallint"), ("wen_du", "double precision"));
+        var existing = Existing("plc01_fast",
+            ("ts", "timestamp"), ("q", "smallint"), ("Wen_Du", "double precision"), ("wen_du", "double precision"));
+
+        var message = Assert.Throws<MigrationConflictException>(
+            () => MigrationPlanner.Plan(desired, new[] { existing }, SafeOptions)).Message;
+
+        message.Should().Contain("Wen_Du").And.Contain("wen_du");
+    }
+
+    /// <summary>
+    /// 与上一条配对：两列**类型不同**时也必须抛（暴露后果的那一面 ——
+    /// 静默合并会按行序在这两列里挑一个当"真相"，从而给出随机的冲突/通过结论）。
+    /// </summary>
+    [Fact]
+    public void 现存列仅大小写不同且类型不同时同样抛异常()
+    {
+        var desired = Table("plc01_fast", ("ts", "timestamp"), ("q", "smallint"), ("wen_du", "double precision"));
+        var existing = Existing("plc01_fast",
+            ("ts", "timestamp"), ("q", "smallint"), ("Wen_Du", "boolean"), ("wen_du", "double precision"));
+
+        var act = () => MigrationPlanner.Plan(desired, new[] { existing }, SafeOptions);
+
+        act.Should().Throw<MigrationConflictException>().WithMessage("*Wen_Du*").WithMessage("*wen_du*");
+    }
+
+    /// <summary>
+    /// 大小写等价但拼写不同的**表**同样响亮抛出（与列政策统一），
+    /// 且不能用 <c>ToDictionary</c> 抛 "已添加相同键的项" 那种与语义无关的异常。
+    /// </summary>
+    [Fact]
+    public void 现存表仅大小写不同时抛异常并指名两个拼写()
+    {
+        var desired = Table("plc01_fast", ("ts", "timestamp"), ("q", "smallint"));
+        var existing = new[]
+        {
+            Existing("PLC01_Fast", ("ts", "timestamp"), ("q", "smallint")),
+            Existing("plc01_fast", ("ts", "timestamp"), ("q", "smallint")),
+        };
+
+        var message = Assert.Throws<MigrationConflictException>(
+            () => MigrationPlanner.Plan(desired, existing, SafeOptions)).Message;
+
+        message.Should().Contain("PLC01_Fast").And.Contain("plc01_fast");
     }
 
     [Fact]
@@ -689,9 +1053,9 @@ public class MigrationPlannerTests
         var plan = MigrationPlanner.Plan(schema, Array.Empty<ExistingTable>(), SafeOptions);
 
         plan.Steps.Single(s => s.Kind == MigrationStepKind.CreateTable).Sql.Should().Be(
-            "create table if not exists d.plc01_fast (\n" +
+            "create table if not exists d.\"plc01_fast\" (\n" +
             "  \"ts\" timestamp not null,\n" +
-            "  \"q\" smallint not null default 0,\n" +
+            "  \"q\" smallint default 0 not null,\n" +
             "  \"src_ts\" timestamp null,\n" +
             "  \"yao_wei_wen_du\" double precision null,\n" +
             "  \"feng_ji_yun_xing\" boolean null\n" +
@@ -717,19 +1081,25 @@ public class MigrationPlannerTests
         plan.DestructiveSteps.Should().BeEmpty();
     }
 
+    /// <summary>
+    /// 大小写等价的重复列**响亮抛出**，而不是抛 <c>ToDictionary</c> 那种
+    /// "已添加相同键的项"（<see cref="ArgumentException"/>，消息里既没有表名也没有列名）。
+    /// 异常类型必须是本领域自己的 <see cref="MigrationConflictException"/>，
+    /// 这样界面才能把它当作"要用户决策"而不是"程序出错"来呈现。
+    /// </summary>
     [Fact]
-    public void 仓库里存在仅大小写不同的重复列时不抛无关异常()
+    public void 大小写等价的重复列抛领域异常而不是字典异常()
     {
-        // 加引号建过表的库里可能出现 "Wen_Du" 与 "wen_du" 并存。
-        // 大小写不敏感比对下两者是同一个键，若用 ToDictionary 会抛"已添加相同键的项"——
-        // 那是与本方法语义无关的异常。期望行为：取先出现的一列，正常规划。
         var desired = Table("plc01_fast", ("ts", "timestamp"), ("q", "smallint"), ("wen_du", "double precision"));
         var existing = Existing("plc01_fast",
             ("ts", "timestamp"), ("q", "smallint"), ("Wen_Du", "double precision"), ("wen_du", "double precision"));
 
-        var plan = MigrationPlanner.Plan(desired, new[] { existing }, SafeOptions);
+        var message = Assert.Throws<MigrationConflictException>(
+            () => MigrationPlanner.Plan(desired, new[] { existing }, SafeOptions)).Message;
 
-        plan.IsEmpty.Should().BeTrue();
+        // 断言"精确类型"而非"是 Exception 的某个子类"：Assert.Throws<T> 要求**恰好**是 T，
+        // 故若哪天退回 ArgumentException（ToDictionary 撞键）这条会立刻红。
+        message.Should().Contain("Wen_Du").And.Contain("wen_du");
     }
 
     [Fact]
@@ -775,6 +1145,13 @@ public class MigrationPlannerTests
     /// 手工构造期望结构。列的可空性复刻 <c>DesiredSchemaBuilder</c> 的固定列规则
     /// （ts / q 非空，其余可空），与生产代码的一致性由
     /// <see cref="夹具与真实_DesiredSchemaBuilder_的固定列保持一致"/> 锁定。
+    /// <para>
+    /// ⚠️ 固定列的识别用 <c>OrdinalIgnoreCase</c>：生产侧对质量列的大小写是**不敏感**的
+    /// （<c>DesiredSchemaBuilder</c> 的去重守卫保证任何拼写的固定列都只可能有一个，
+    /// <c>ColumnDefinitionSql</c> 也按不敏感判定是否加 <c>default 0</c>），
+    /// 夹具必须同规则，否则"质量列大小写"这类用例会被夹具自己的偏差误导
+    /// （我第一版用 <c>Ordinal</c>，把 <c>Q</c> 误标成可空，测试因此假红过一次）。
+    /// </para>
     /// </summary>
     private static DesiredSchema Table(string name, params (string Name, string Type)[] columns) =>
         new(new[]
@@ -783,8 +1160,8 @@ public class MigrationPlannerTests
                 .Select(c => new DesiredColumn(
                     c.Name,
                     c.Type,
-                    IsNullable: !c.Name.Equals(DesiredSchema.TimestampColumn, StringComparison.Ordinal)
-                                && !c.Name.Equals(DesiredSchema.QualityColumn, StringComparison.Ordinal)))
+                    IsNullable: !c.Name.Equals(DesiredSchema.TimestampColumn, StringComparison.OrdinalIgnoreCase)
+                                && !c.Name.Equals(DesiredSchema.QualityColumn, StringComparison.OrdinalIgnoreCase)))
                 .ToList()),
         });
 

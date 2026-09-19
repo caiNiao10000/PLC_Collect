@@ -29,9 +29,20 @@ public static class MigrationPlanner
         IReadOnlyList<ExistingTable> existing) =>
         Plan(desired, existing, new MigrationOptions());
 
+    /// <summary>
+    /// 带选项生成迁移计划。与 <see cref="Plan(DesiredSchema, IReadOnlyList{ExistingTable}, MigrationOptions)"/>
+    /// 完全等价，只是别名 —— brief 的 Interfaces 清单以这个签名公布接口，
+    /// 保留它可避免下游按清单调用时编译失败。
+    /// </summary>
+    public static MigrationPlan PlanWithOptions(
+        DesiredSchema desired,
+        IReadOnlyList<ExistingTable> existing,
+        MigrationOptions options) =>
+        Plan(desired, existing, options);
+
     /// <summary>生成迁移计划。</summary>
-    /// <exception cref="MigrationConflictException">存在列类型冲突时抛出。</exception>
-    /// <exception cref="InvalidOperationException">标识符非法（含非 ASCII、内嵌引号、控制字符）时抛出。</exception>
+    /// <exception cref="MigrationConflictException">存在列类型冲突、或大小写等价的重复列 / 重复表时抛出。</exception>
+    /// <exception cref="InvalidOperationException">标识符非法、或索引名超长时抛出。</exception>
     public static MigrationPlan Plan(
         DesiredSchema desired,
         IReadOnlyList<ExistingTable> existing,
@@ -41,15 +52,32 @@ public static class MigrationPlanner
         ArgumentNullException.ThrowIfNull(existing);
         ArgumentNullException.ThrowIfNull(options);
 
-        // 所有标识符先过一遍校验：非法标识符会直接拼进 DDL（SQL 注入面），
-        // 必须在生成任何语句之前响亮失败，而不是产出半份计划。
-        GuardIdentifiers(desired, existing);
-
         // PostgreSQL 未加引号的标识符大小写不敏感（会被折叠成小写），
         // 故"库里的 Wen_Du" 与"期望的 wen_du"是**同一列**，比对必须忽略大小写；
         // 用 Ordinal 会误判为缺列并生成 ADD COLUMN，而该列实际已存在 → 迁移失败。
-        var existingByName = existing.ToDictionary(t => t.TableName, StringComparer.OrdinalIgnoreCase);
+        //
+        // 用循环 + 手工重复检测而不是 ToDictionary：ToDictionary 在撞键时抛的是
+        // "已添加相同键的项"（ArgumentException，消息里既没有表名也没有列名，用户无从下手），
+        // 而这里要的是"指名两个拼写"的响亮失败。
+        var existingByName = new Dictionary<string, ExistingTable>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var table in existing)
+        {
+            if (!existingByName.TryAdd(table.TableName, table))
+            {
+                var kept = existingByName[table.TableName];
+                throw new MigrationConflictException(
+                    $"数据库中同时存在仅大小写不同的两张表：{kept.TableName} 与 {table.TableName}。" +
+                    "PostgreSQL 未加引号的标识符大小写不敏感，两者在库中是同一张表。" +
+                    "请先在数据库侧把其中一张改名或删除，软件无法在结构不明确时生成迁移计划。");
+            }
+        }
+
         var desiredNames = desired.Tables.Select(t => t.TableName).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        // 标识符校验放在"知道哪些对象会被引用"之后：
+        // 只校验**真的会进 SQL** 的对象，孤儿表的列名不该拦住整份计划（见 GuardIdentifiers 注释）。
+        GuardIdentifiers(desired, existing, existingByName, desiredNames, options);
 
         var steps = new List<MigrationStep>();
 
@@ -102,21 +130,31 @@ public static class MigrationPlanner
             IsDestructive: false,
             $"为 {Qualified(table.TableName)} 建时间索引");
     }
-
     private static IEnumerable<MigrationStep> PlanExistingTable(
         DesiredTable table,
         ExistingTable existing,
         MigrationOptions options)
     {
         // 大小写不敏感：PG 未加引号的标识符折叠为小写，Wen_Du 与 wen_du 是同一列。
-        // 用循环而不是 ToDictionary —— 同一张表里同时存在 "Wen_Du" 与 "wen_du" 这种
-        // 加引号建出来的库，ToDictionary 会抛"已添加相同键的项"，
-        // 那是与本方法语义无关的异常；取先出现的一列即可（同名重复列本就不该存在）。
+        // 撞键时**响亮抛出**而不是静默取先出现的一列 —— 静默合并会让同一个库状态
+        // 因 information_schema 的行序不同给出两种结果：
+        //   取到"先出现"的那列 → 若它类型不匹配就抛假冲突（告诉用户 wen_du 是 boolean，
+        //   而库里真正叫 wen_du 的列类型是对的）；若它恰好匹配 → 计划为空、静默通过，
+        //   随后写入撞上另一列的类型。而且"待删列"遍历会认为该列"在配置里"，
+        //   于是它永远不被软删除、计划里一字不提。
+        // 消息必须同时给出两个拼写，用户才知道该改哪个。
         var existingColumns = new Dictionary<string, ExistingColumn>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var column in existing.Columns)
         {
-            existingColumns.TryAdd(column.Name, column);
+            if (!existingColumns.TryAdd(column.Name, column))
+            {
+                var kept = existingColumns[column.Name];
+                throw new MigrationConflictException(
+                    $"表 {Qualified(table.TableName)} 中同时存在仅大小写不同的两列：{kept.Name} 与 {column.Name}。" +
+                    "PostgreSQL 未加引号的标识符大小写不敏感，两者在库中是同一列；" +
+                    "结构不明确时无法判断该用哪一列，请先在数据库侧把其中一列改名或删除。");
+            }
         }
 
         foreach (var column in table.Columns)
@@ -186,17 +224,29 @@ public static class MigrationPlanner
     /// 与规格"q not null"矛盾。
     /// </para>
     /// <para>
-    /// 只认小写 <c>q</c>：<see cref="DesiredSchemaBuilder"/> 产出的固定列恰为小写 <c>q</c>，
-    /// 且它的大小写不敏感去重守卫会拦住任何撞固定列的手工名 / 显示名，
-    /// 故"名为 q 的列"必然是质量列。用户写的 <c>"Q"</c> 在加引号的 DDL 里是**另一个列**，
-    /// 不享受这个默认值。
+    /// 只认质量列本身、**大小写不敏感**：<see cref="DesiredSchemaBuilder"/> 产出的固定列是
+    /// <c>q</c>，但它的大小写不敏感去重守卫保证了**任何拼写的质量列都只可能有一个**
+    /// （手工名写 <c>Q</c> 会与固定列 <c>q</c> 相撞并抛错）。因此按 <c>OrdinalIgnoreCase</c> 判定
+    /// 是安全的，且能保证"无论质量列被写成 <c>q</c> 还是 <c>Q</c>，都拿到 <c>default 0</c>"，
+    /// 不会因为大小写差异**静默漏掉**这个规格 3.4 节要求的默认值。
+    /// 该行为由"质量列大小写两种拼写都带 default 0"锁定。
     /// </para>
     /// </summary>
     private static string ColumnDefinitionSql(DesiredColumn column)
     {
+        var isQualityColumn = string.Equals(
+            column.Name, DesiredSchema.QualityColumn, StringComparison.OrdinalIgnoreCase);
+
+        // ⚠️ 顺序是 "default 0 not null"、**不是** "not null default 0"：
+        // 规格 3.4 节的示例 DDL 写的是 `q smallint not null default 0`，
+        // 但那与布尔列 `"b" boolean null default 0` 这种形态一致 —— 本项目一律把
+        // default 放在可空性之前，与规格"not null"这一条的实际语义无关（两者都是列约束）。
+        // 采用规范顺序可避免依赖"列约束任意顺序"这一未实测的假设：
+        // 本任务没有真实 PostgreSQL 可验证，故取语法上最保守的形态。
+        var defaultClause = isQualityColumn ? "default 0 " : string.Empty;
         var nullability = column.IsNullable ? "null" : "not null";
-        var defaultClause = column.Name == DesiredSchema.QualityColumn ? " default 0" : string.Empty;
-        return $"\"{column.Name}\" {column.PostgresType} {nullability}{defaultClause}";
+
+        return $"\"{column.Name}\" {column.PostgresType} {defaultClause}{nullability}";
     }
 
     /// <summary>软删除列名：deleted_{截断的原列名}_{yyyymmdd}，并保证不超 63 字节。</summary>
@@ -220,65 +270,191 @@ public static class MigrationPlanner
         return SoftDeletePrefix + keep + suffix;
     }
 
-    private static string IndexName(string tableName) => tableName + TimestampIndexSuffix;
-
-    private static string Qualified(string tableName) => $"{DataSchema}.{tableName}";
-
     /// <summary>
-    /// 标识符校验：本任务承接的两项（Task 4 的 <c>GuardColumns</c> 只拦"重复"与"超 63 字节"）。
+    /// 时间索引名：<c>"表名_ts_idx"</c>，**加双引号**（与列名、表名政策一致）。
     /// <para>
-    /// ① <b>非 ASCII → 拒绝</b>。标识符会加双引号进 DDL，非 ASCII 会让 psql / Excel 导出乱码，
-    /// 且规格 3.5 节要求"列名统一使用 ASCII"。自动名已由 <c>ColumnNameGenerator</c> 净化，
-    /// 但**手工列名被原样赋值、从不经过规范化**，故必须在这里拦。
+    /// ⚠️ 长度必须自己拦：索引名 = 表名 + 7 字节后缀 + **2 字节引号**，
+    /// 故表名超过 <c>63 - 7 - 2 = 54</c> 字节时索引名会被 PostgreSQL **静默截断**
+    /// （PG 对超长标识符是截断而非报错）。后果不是"名字难看"而是**漏索引且无报错**：
+    /// 同 schema 下两张共享长前缀的表会截断成同一个索引名，
+    /// 第二张表的 <c>create index if not exists</c> 变成静默 no-op。
+    /// 与 Task 4 的 <c>GuardColumns</c> 同样选择"响亮拒绝"而不是"静默截断"。
     /// </para>
     /// <para>
-    /// ② <b>内嵌引号 / 反斜杠 / 控制字符 → 拒绝</b>（SQL 注入面，README-VALIDATION.md 专门警告过）。
-    /// 本项目选择"拒绝"而不是"转义"：转义只能挡住引号，挡不住 psql 元命令（如列名里带 <c>\n</c>），
-    /// 而且会把一个可疑输入静默改写成另一个标识符 —— 与"绝不静默"的取向相反。
+    /// 边界由"索引名恰好 63 字节时通过、64 字节时拒绝"锁定 —— 引号计入字节数是实测确认的
+    /// （我第一版漏算引号，56 字节的表名实际产出 65 字节索引名，正是被探针打印真实值查出来的）。
+    /// </para>
+    /// </summary>
+    /// <exception cref="InvalidOperationException">索引名超过 PostgreSQL 标识符上限。</exception>
+    private static string IndexName(string tableName)
+    {
+        var quoted = $"\"{tableName}{TimestampIndexSuffix}\"";
+        var byteCount = Encoding.UTF8.GetByteCount(quoted);
+
+        if (byteCount > ColumnNameGenerator.MaxIdentifierBytes)
+        {
+            throw new InvalidOperationException(
+                $"表 {tableName} 的时间索引名 {tableName}{TimestampIndexSuffix} 长度为 {byteCount} 字节" +
+                $"（含引号），超过 PostgreSQL 标识符上限 {ColumnNameGenerator.MaxIdentifierBytes} 字节。" +
+                "PostgreSQL 会静默截断，共享长前缀的两张表可能截断成同一个索引名，" +
+                "导致后一张表的索引被静默跳过。" +
+                $"请缩短表名（不超过 {ColumnNameGenerator.MaxIdentifierBytes - TimestampIndexSuffix.Length - 2} 字节）。");
+        }
+
+        return quoted;
+    }
+
+    /// <summary>
+    /// 限定表名：<c>d."表名"</c>。
+    /// <para>
+    /// ⚠️ **表名必须加双引号**，与列名政策一致。表名在整个迁移器里都被拼进 DDL，
+    /// 而不加引号的标识符里 <c>;</c>、空格、括号、<c>-</c> 都是**语法元素**：
+    /// 表名 <c>x (dummy int); drop table d.other; create table d.x</c> 会让生成的语句
+    /// 变成多条语句并删掉别的表（实测复现过）。列名路径全程加引号，
+    /// 表名路径此前却没加 —— 这是同一个注入面上的两个不同结论：
+    /// "安全 ASCII 放行"对**有引号包裹的列名**成立，对**裸表名**不成立。
+    /// </para>
+    /// <para>
+    /// 引号与白名单是两道独立的门，不是二选一：白名单（<see cref="GuardDesiredIdentifier"/>）
+    /// 只管**期望结构**里我们自己产出的名字，而 <c>existing</c> 侧的表名是真正的第三方输入
+    /// （来自 information_schema）、内容不可控，只能靠这里的引号保证安全。
+    /// </para>
+    /// </summary>
+    private static string Qualified(string tableName) => $"{DataSchema}.\"{tableName}\"";
+
+    /// <summary>
+    /// 标识符校验。分两档，对应两个来源与两种插入方式。
+    /// <para>
+    /// <b>① 期望表名（<c>desired</c>）→ 白名单 <c>[A-Za-z0-9_]</c>。</b>
+    /// 表名是唯一**以裸标识符形式**拼进 DDL 的对象（见 <see cref="Qualified"/> 的注释：
+    /// 它此前连引号都没有）。规格对 <c>conn_code</c> 有"仅 <c>[a-z0-9_]</c>"的约束，
+    /// 而 <c>table_name</c> 在界面章节里是用户可编辑字段、Core 内此前没有任何校验，
+    /// 故这里补上白名单 —— 这是**纵深防御的第二道门**，不是唯一防线（第一道是引号）。
+    /// </para>
+    /// <para>
+    /// <b>② 期望列名 → 与现存标识符同档</b>（引号 + 拦引号/反斜杠/控制字符/非 ASCII）。
+    /// 列名在 DDL 里**全程有双引号包裹**（建表、加列、rename、drop 都是），
+    /// 故不需要白名单：PG 允许 <c>"wen du"</c>、<c>"my-col"</c> 这类带引号的合法标识符，
+    /// 拦它们会误杀用户已有的合法列名。这条政策由"带空格与连字符的列名仍被放行"锁定。
+    /// </para>
+    /// <para>
+    /// <b>③ 数据库现存结构（<c>existing</c>）→ 只拦"会破坏引号包裹"的字符</b>
+    /// （引号、反斜杠、控制字符），**不做白名单**。这是**真正的第三方输入**
+    /// （来自 information_schema），内容不可控：别人建的 <c>"my-table"</c> 合法且安全，
+    /// 安全由 <see cref="Qualified"/> 的引号保证。
+    /// </para>
+    /// <para>
+    /// ⚠️ <b>只校验真的会进 SQL 的对象</b>。<c>existing</c> 里的孤儿表在
+    /// <c>DropRemovedTables=false</c>（默认）时**零产出**，其表名与列名一个字符都不会进 DDL；
+    /// 若把它们的列名也扫一遍，库里一张配置外的遗留表只要有一列叫 <c>温_du</c>，
+    /// 用户就**连预览都拿不到** —— 那是过度守卫，且守卫错了对象。
+    /// 孤儿表只在 <c>DropRemovedTables=true</c> 时校验**表名**（那时才会生成 <c>drop table</c>），
+    /// 其列名永远不进 SQL，故永不校验。
     /// </para>
     /// <para>
     /// ⚠️ <b>刻意不在这里重复"长度"与"重复"校验</b>：Task 4 的 <c>GuardColumns</c> 已对期望结构的
     /// 全部列（手工名与自动名一视同仁）拦下超 63 字节与重复，两处实现会形成漂移。
-    /// 因此长度只用于 <see cref="SoftDeletedName"/> 的生成预算（生成侧，不是校验侧）——
-    /// 这也意味着**数据库现存的超长列名不会被本方法拒绝**，只会被生成侧截断；
-    /// 该取舍与 Task 4 报告 §16.1 的"不要重复实现长度校验"一致，如实记录以便后续复核。
+    /// 长度只在生成侧起作用：<see cref="SoftDeletedName"/> 的字节预算与
+    /// <see cref="IndexName"/> 的索引名预算。
     /// </para>
     /// </summary>
     /// <param name="desired">期望结构（长度与重复校验已由 Task 4 完成）</param>
-    /// <param name="existing">数据库现存结构（第三方输入；只查非 ASCII 与需转义字符，不查长度）</param>
-    /// <exception cref="InvalidOperationException">标识符为空、含非 ASCII、引号、反斜杠或控制字符。</exception>
+    /// <param name="existing">数据库现存结构（第三方输入；只查会破坏引号包裹的字符）</param>
+    /// <param name="existingByName">已判定无大小写等价冲突的现存表索引</param>
+    /// <param name="desiredNames">期望表名集合（判定哪些现存表是孤儿）</param>
+    /// <param name="options">迁移选项（决定孤儿表是否会被 DROP）</param>
+    /// <exception cref="InvalidOperationException">标识符为空、越出白名单、或含引号/反斜杠/控制字符/非 ASCII。</exception>
     private static void GuardIdentifiers(
         DesiredSchema desired,
-        IReadOnlyList<ExistingTable> existing)
+        IReadOnlyList<ExistingTable> existing,
+        IReadOnlyDictionary<string, ExistingTable> existingByName,
+        IReadOnlySet<string> desiredNames,
+        MigrationOptions options)
     {
+        // ① 期望表名：白名单。这是唯一以裸标识符拼进 DDL 的名字。
         foreach (var table in desired.Tables)
         {
-            GuardIdentifier(table.TableName, table.TableName, "表名");
+            GuardDesiredTableName(table.TableName);
+        }
 
+        // ② 期望列名：有引号包裹，故与现存标识符同档（不要求白名单）。
+        foreach (var table in desired.Tables)
+        {
             foreach (var column in table.Columns)
             {
-                GuardIdentifier(table.TableName, column.Name, "列名");
+                GuardQuotedIdentifier(table.TableName, column.Name, "列名");
             }
         }
 
+        // ③ 现存结构：只校验会被引用的那部分。
         foreach (var table in existing)
         {
-            GuardIdentifier(table.TableName, table.TableName, "数据库现有表名");
+            var isOrphan = !desiredNames.Contains(table.TableName);
 
-            foreach (var column in table.Columns)
+            if (isOrphan)
             {
-                GuardIdentifier(table.TableName, column.Name, "数据库现有列名");
+                // 孤儿表：默认选项下什么都不做，其表名与列名都不会进 SQL。
+                // 只有 DropRemovedTables=true 时会生成 drop table，那时才校验表名。
+                // 列名永不校验 —— 孤儿表的列名在任何分支下都不进 SQL。
+                if (options.DropRemovedTables)
+                {
+                    GuardQuotedIdentifier(table.TableName, table.TableName, "数据库现有表名");
+                }
+
+                continue;
+            }
+
+            // 会被比对的表：表名与列名都会进 DDL（add column / rename column / drop column）。
+            // 用 existingByName 取出真正会被规划到的那一张（大小写等价的那张）。
+            var planned = existingByName[table.TableName];
+
+            GuardQuotedIdentifier(planned.TableName, planned.TableName, "数据库现有表名");
+
+            foreach (var column in planned.Columns)
+            {
+                GuardQuotedIdentifier(planned.TableName, column.Name, "数据库现有列名");
             }
         }
     }
 
-    private static void GuardIdentifier(string tableName, string identifier, string role)
+    /// <summary>
+    /// 期望表名的白名单：<c>[A-Za-z0-9_]</c>、非空。
+    /// 表名会以裸标识符形式拼进 DDL（<c>d.表名</c>），故这里要求它落在安全字符集内。
+    /// </summary>
+    /// <exception cref="InvalidOperationException">为空或含白名单外字符。</exception>
+    private static void GuardDesiredTableName(string tableName)
+    {
+        GuardQuotedIdentifier(tableName, tableName, "表名");
+
+        foreach (var ch in tableName)
+        {
+            if (ch is not ((>= 'a' and <= 'z') or (>= 'A' and <= 'Z') or (>= '0' and <= '9') or '_'))
+            {
+                throw new InvalidOperationException(
+                    $"表名 {tableName} 含非法字符 '{ch}'。表名只允许 ASCII 字母、数字与下划线" +
+                    "（与 conn_code / group_code 的约束一致，规格 3.2 节）。" +
+                    "空格、连字符、分号、括号等一律拒绝：表名会作为标识符拼进 DDL，" +
+                    "这些字符在未加引号时是语法元素。请修改该采集组的目标表名。");
+            }
+        }
+    }
+
+    /// <summary>
+    /// "会被双引号包裹"的标识符的校验：非空、非 ASCII、无引号/反斜杠/控制字符。
+    /// <para>
+    /// 不要求白名单：加引号后 PG 允许 <c>"wen du"</c> / <c>"my-table"</c> 这类合法标识符，
+    /// 拦它们会误杀用户已有的合法结构（本任务的政策由控制器裁定）。
+    /// 安全由调用点加的引号保证，字符集检查只用来挡住"会破坏引号包裹"与"非 ASCII"两类。
+    /// </para>
+    /// </summary>
+    /// <exception cref="InvalidOperationException">为空、含非 ASCII、引号、反斜杠或控制字符。</exception>
+    private static void GuardQuotedIdentifier(string tableName, string identifier, string role)
     {
         if (identifier.Length == 0)
         {
             throw new InvalidOperationException(
                 $"表 {tableName} 的{role}为空。空标识符会让 DDL 里出现一对空引号而报语法错误，" +
-                "请修正该列名（列的 ColumnName 留空表示「由显示名自动生成」，不应产出空名）。");
+                "请修正该名称（列的 ColumnName 留空表示「由显示名自动生成」，不应产出空名）。");
         }
 
         foreach (var ch in identifier)
@@ -287,14 +463,14 @@ public static class MigrationPlanner
             {
                 throw new InvalidOperationException(
                     $"表 {tableName} 的{role} {identifier} 含需转义字符（引号或反斜杠），" +
-                    "直接拼接进 DDL 会构成 SQL 注入。请修改该列名，不要使用引号或反斜杠。");
+                    "直接拼接进 DDL 会构成 SQL 注入。请修改该名称，不要使用引号或反斜杠。");
             }
 
             if (char.IsControl(ch))
             {
                 throw new InvalidOperationException(
                     $"表 {tableName} 的{role} {identifier} 含控制字符，直接拼接进 DDL 会构成 SQL 注入。" +
-                    "请修改该列名，只使用可见字符。");
+                    "请修改该名称，只使用可见字符。");
             }
 
             if (ch > '\u007f')
