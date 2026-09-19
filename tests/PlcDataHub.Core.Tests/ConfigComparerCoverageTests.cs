@@ -44,6 +44,8 @@ public class ConfigComparerCoverageTests
     {
         [typeof(PointConfig)] = "PointEquivalent",
         [typeof(PollGroup)] = "GroupsEquivalent",
+        [typeof(S7Address)] = "S7Equivalent",
+        [typeof(ModbusAddress)] = "ModbusEquivalent",
     };
 
     [Fact]
@@ -266,47 +268,80 @@ public class ConfigComparerCoverageTests
     }
 
     /// <summary>
+    /// 找到指定方法<b>声明</b>处的方法体起点（表达式体 <c>=&gt;</c> 的 <c>=</c>，或块体的 <c>{</c>）。
+    /// <para>
+    /// 不能直接用第一次文本出现来定位：辅助方法会先以<b>调用点</b>的形式出现在别的方法体里
+    /// （例如 PointEquivalent 里的 <c>S7Equivalent(left.S7, right.S7)</c>），
+    /// 只取 <c>IndexOf</c> 会把调用点当成声明。
+    /// 实测表现：报"方法体应当是表达式体（以 '=&gt;' 开始）, but found &amp;"。
+    /// </para>
+    /// 判定规则：配平参数表之后，紧随其后（跳过空白）是 <c>=&gt;</c> 或 <c>{</c> 的才是声明；
+    /// 调用点后面通常是 <c>;</c> / <c>)</c> / <c>&amp;</c>，会被跳过继续往后找。
+    /// </summary>
+    private static int FindMethodBodyStart(string source, string methodName)
+    {
+        var searchFrom = 0;
+
+        while (true)
+        {
+            var candidate = source.IndexOf($"{methodName}(", searchFrom, StringComparison.Ordinal);
+            if (candidate < 0)
+            {
+                throw new InvalidOperationException($"ConfigComparer 里找不到 {methodName} 的方法声明");
+            }
+
+            // 配平该候选位置的参数表
+            var cursor = source.IndexOf('(', candidate);
+            var parenDepth = 0;
+            for (; cursor < source.Length; cursor++)
+            {
+                if (source[cursor] == '(')
+                {
+                    parenDepth++;
+                }
+                else if (source[cursor] == ')')
+                {
+                    parenDepth--;
+                    if (parenDepth == 0)
+                    {
+                        break;
+                    }
+                }
+            }
+
+            if (cursor >= source.Length)
+            {
+                throw new InvalidOperationException($"{methodName} 的参数表未正常闭合");
+            }
+
+            var after = cursor + 1;
+            while (after < source.Length && char.IsWhiteSpace(source[after]))
+            {
+                after++;
+            }
+
+            var isExpressionBody = after + 1 < source.Length
+                && source[after] == '='
+                && source[after + 1] == '>';
+
+            if (isExpressionBody || (after < source.Length && source[after] == '{'))
+            {
+                return after;
+            }
+
+            searchFrom = candidate + methodName.Length;
+        }
+    }
+
+    /// <summary>
     /// 提取指定方法的方法体源码。同时支持<b>表达式体</b>（<c>=&gt; …;</c>）与<b>块体</b>（<c>{ … }</c>），
-    /// 因为 ConfigComparer 里两种写法都有：PointEquivalent / GroupsEquivalent 是表达式体，
-    /// PointsEquivalent / S7Equivalent / ModbusEquivalent 是块体。
+    /// 因为 ConfigComparer 里两种写法都有：PointEquivalent / GroupsEquivalent / S7Equivalent /
+    /// ModbusEquivalent 是表达式体，PointsEquivalent 是块体。
     /// </summary>
     private static string ReadMethodBody(string fileName, string methodName)
     {
         var source = StripComments(ReadSourceFile(fileName));
-
-        var signatureIndex = source.IndexOf($"{methodName}(", StringComparison.Ordinal);
-        signatureIndex.Should().BeGreaterThanOrEqualTo(
-            0, $"ConfigComparer 必须包含 {methodName} 方法");
-
-        // 先配平参数表的圆括号，避免参数里的括号干扰方法体定位
-        var cursor = source.IndexOf('(', signatureIndex);
-        var parenDepth = 0;
-        for (; cursor < source.Length; cursor++)
-        {
-            if (source[cursor] == '(')
-            {
-                parenDepth++;
-            }
-            else if (source[cursor] == ')')
-            {
-                parenDepth--;
-                if (parenDepth == 0)
-                {
-                    break;
-                }
-            }
-        }
-
-        cursor.Should().BeLessThan(source.Length, $"{methodName} 的参数表未正常闭合");
-
-        // 跳过空白，判断是块体还是表达式体
-        cursor++;
-        while (cursor < source.Length && char.IsWhiteSpace(source[cursor]))
-        {
-            cursor++;
-        }
-
-        cursor.Should().BeLessThan(source.Length, $"{methodName} 之后应当有方法体");
+        var cursor = FindMethodBodyStart(source, methodName);
 
         if (source[cursor] == '{')
         {
