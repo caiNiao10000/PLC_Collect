@@ -116,13 +116,22 @@ D:\deepseek\PLC_Collect\
 - Consumes: 无（第一个任务）
 - Produces: 可编译的解决方案骨架；`Directory.Build.props` 中锁定的 `net8.0-windows`，后续所有 csproj 自动继承
 
-- [ ] **Step 1: 确认 .NET 8 SDK 已安装**
+- [ ] **Step 1: 确认工具链（本机已实测，不需要 .NET 8 SDK）**
 
 Run:
 ```powershell
 dotnet --list-sdks
+dotnet --list-runtimes | Select-String 'NETCore.App 8\.'
 ```
-Expected: 输出中包含一个 `8.0.x` 开头的条目。若没有，**停下来**，请用户安装 .NET 8 SDK（用户已确认自行安装）。
+
+Expected: SDk 有 **10.0.401** 或任意版本即可；运行时必须有 **8.0.x**。
+
+> **实测结论（2026-02-09 在本机验证）**：**不需要安装 .NET 8 SDK**。
+> 本机只有 .NET 10 SDK（10.0.401），配合已装的 .NET 8.0.22 运行时，
+> 可以正常构建并测试 `net8.0-windows` 目标——.NET 8 的引用包由 NuGet 自动获取，
+> 测试实际运行在 .NET 8.0.22 上。
+> 已验证：`dotnet build` 输出 `bin\Debug\net8.0-windows\win-x64\`，`dotnet test` 通过。
+> 因此本步骤**不需要停下来装 SDK**，除非 `dotnet --list-runtimes` 里没有 8.0.x。
 
 - [ ] **Step 2: 创建 `Directory.Build.props`**
 
@@ -161,6 +170,16 @@ Expected: 输出中包含一个 `8.0.x` 开头的条目。若没有，**停下�
   <PropertyGroup>
     <RootNamespace>PlcDataHub.Core</RootNamespace>
   </PropertyGroup>
+  <ItemGroup>
+    <!--
+      必须排除 tests 子目录。SDK 风格项目默认把目录树下的所有 .cs 都编译进来，
+      如果测试项目建在本项目的子目录里，测试源码会被编进类库并报
+      "未能找到类型或命名空间名 Xunit" —— 而且错误会指向类库，极难排查。
+      本机已实测踩到这个坑。见 Task 6 / Task 8 的模板生成命令。
+    -->
+    <Compile Remove="tests\**" />
+    <None Remove="tests\**" />
+  </ItemGroup>
 </Project>
 ```
 
@@ -177,7 +196,7 @@ namespace PlcDataHub.Core;
 /// </summary>
 public static class TargetFrameworkProbe
 {
-    /// <summary>返回本程序集编译时使用的目标框架名，例如 "net8.0-windows"。</summary>
+    /// <summary>返回本程序集编译时使用的目标框架名，实测值为 ".NETCoreApp,Version=v8.0"。</summary>
     public static string TargetFramework =>
         System.Reflection.Assembly.GetExecutingAssembly()
             .GetCustomAttributes(typeof(System.Runtime.Versioning.TargetFrameworkAttribute), false)
@@ -186,6 +205,8 @@ public static class TargetFrameworkProbe
             : throw new InvalidOperationException("找不到 TargetFrameworkAttribute");
 }
 ```
+
+> Step 5b 会把本文件替换为同时暴露平台信息的版本。先按上面这个写，测试先跑通一次。
 
 路径：`tests/PlcDataHub.Core.Tests/PlcDataHub.Core.Tests.csproj`
 
@@ -232,9 +253,69 @@ public class TargetFrameworkTests
 }
 ```
 
-> 注意：`TargetFrameworkAttribute.FrameworkName` 的实际格式是 `.NETCoreApp,Version=v8.0`，
-> **不带** `-windows` 后缀。平台信息在 `TargetPlatformAttribute`（`.NETCoreApp,Version=v8.0` + `Windows`）。
-> 所以第 6 步的断言要按实际格式写——先跑一次拿到真实值再定稿。
+> **实测值（2026-02-09 本机验证，直接照此断言，不需要再试）**：
+> - `TargetFrameworkAttribute.FrameworkName` = `.NETCoreApp,Version=v8.0`（**不带** `-windows` 后缀）
+> - `SupportedOSPlatformAttribute.PlatformName` = `Windows7.0`（这是 `net8.0-windows` 的 TFM 下限，不是实际系统版本）
+> - 测试实际运行在 `.NET 8.0.22` 上
+>
+> 单看 `FrameworkName` 只能证明是 net8.0，**不能证明是 `-windows` 变体**。
+> 所以再加一条 `SupportedOSPlatform == "Windows7.0"` 的断言把平台也锁住——
+> 若有人把 TFM 改成 `net8.0`（去掉 `-windows`），这条会失败。
+> 下面的 `FrameworkProbe` 同时暴露这两个值。
+
+- [ ] **Step 5b: 让探针同时暴露平台信息**
+
+路径：`src/PlcDataHub.Core/TargetFrameworkProbe.cs`（覆盖 Step 4 的版本）
+
+```csharp
+namespace PlcDataHub.Core;
+
+/// <summary>
+/// 目标框架探针。存在的唯一目的是让"框架必须是 net8.0-windows"这条约束
+/// 变成一个会失败的测试，而不是一条只写在文档里的约定。
+/// </summary>
+public static class TargetFrameworkProbe
+{
+    /// <summary>编译时目标框架，实测值为 ".NETCoreApp,Version=v8.0"。</summary>
+    public static string TargetFramework => ReadAttribute<System.Runtime.Versioning.TargetFrameworkAttribute>()?
+        .FrameworkName ?? throw new InvalidOperationException("找不到 TargetFrameworkAttribute");
+
+    /// <summary>编译时支持的最低操作系统平台，net8.0-windows 下实测为 "Windows7.0"。</summary>
+    public static string SupportedPlatform => ReadAttribute<System.Runtime.Versioning.SupportedOSPlatformAttribute>()?
+        .PlatformName ?? throw new InvalidOperationException("找不到 SupportedOSPlatformAttribute");
+
+    private static T? ReadAttribute<T>() where T : Attribute =>
+        (T?)Attribute.GetCustomAttribute(typeof(TargetFrameworkProbe).Assembly, typeof(T));
+}
+```
+
+并把 `TargetFrameworkTests` 改成：
+
+```csharp
+using FluentAssertions;
+using PlcDataHub.Core;
+using Xunit;
+
+namespace PlcDataHub.Core.Tests;
+
+public class TargetFrameworkTests
+{
+    [Fact]
+    public void 目标框架必须是_net8_0()
+    {
+        // 规格 1.5 节：.NET 9/10 已放弃 Windows 10 支持。
+        // 这个断言失败意味着有人升级了框架，会导致 Win10 工控机无法运行。
+        TargetFrameworkProbe.TargetFramework.Should().Be(".NETCoreApp,Version=v8.0");
+    }
+
+    [Fact]
+    public void 必须是_windows_变体而不是裸_net8_0()
+    {
+        // 若有人把 TFM 从 net8.0-windows 改成 net8.0，这条会失败。
+        TargetFrameworkProbe.SupportedPlatform.Should().Be("Windows7.0");
+    }
+}
+```
 
 - [ ] **Step 6: 创建解决方案并加入项目**
 
@@ -249,16 +330,18 @@ dotnet build
 
 Expected: `Build succeeded`，且输出路径含 `net8.0-windows`（例如 `src\PlcDataHub.Core\bin\Debug\net8.0-windows\`）。
 
-- [ ] **Step 7: 运行测试，修正断言中的框架名格式**
+- [ ] **Step 7: 运行测试**（断言值已实测确定，这一步只做验证）
 
 Run:
 ```powershell
-dotnet test tests\PlcDataHub.Core.Tests --filter 目标框架必须是_net8_0_windows -v
+dotnet test tests\PlcDataHub.Core.Tests
 ```
 
-Expected: 若失败且错误信息显示实际值为 `.NETCoreApp,Version=v8.0`，则把断言改成实际值；若实际值里出现了 `v9.0` 或 `v10.0`，**停下来**——说明 `Directory.Build.props` 没生效，必须先修好。
+Expected: `Passed! - Failed: 0, Passed: 2`。
 
-再次运行，Expected: `Passed! - Failed: 0, Passed: 1`。
+若失败，按错误信息判断：
+- 实际值出现 `v9.0` 或 `v10.0` → `Directory.Build.props` 没生效，**停下来先修**
+- 实际值出现 `v8.0` 但平台断言失败 → 有人把 TFM 写成了裸 `net8.0`，检查 `Directory.Build.props`
 
 - [ ] **Step 8: 创建 `.editorconfig` 并提交**
 
@@ -2068,22 +2151,38 @@ public class ByteDecoderTests
 }
 ```
 
-- [ ] **Step 3: 运行测试确认失败**
+- [ ] **Step 3: 建立协议项目与测试项目**
 
 Run:
 ```powershell
 cd D:\deepseek\PLC_Collect
-dotnet new classlib -o src\PlcDataHub.Protocols -f net8.0
-dotnet new xunit -o tests\PlcDataHub.Protocols.Tests -f net8.0
+dotnet new classlib -o src\PlcDataHub.Protocols
+dotnet new xunit -o tests\PlcDataHub.Protocols.Tests --no-restore
 dotnet sln add src\PlcDataHub.Protocols\PlcDataHub.Protocols.csproj tests\PlcDataHub.Protocols.Tests\PlcDataHub.Protocols.Tests.csproj
 dotnet add tests\PlcDataHub.Protocols.Tests reference src\PlcDataHub.Protocols
 dotnet add tests\PlcDataHub.Protocols.Tests reference src\PlcDataHub.Core
 dotnet add src\PlcDataHub.Protocols reference src\PlcDataHub.Core
 ```
 
-然后把两个测试文件的内容按 Step 1 / Step 2 写入，删除模板生成的 `UnitTest1.cs` / `Class1.cs`，
-并**把 `PlcDataHub.Protocols.csproj` 与测试 csproj 里模板自动写入的 `<TargetFramework>` 行删掉**
-（由 `Directory.Build.props` 统一提供 `net8.0-windows`）。
+> **⚠️ 实测陷阱一：不要加 `-f net8.0`。**
+> 本机 .NET 10 SDK 的模板**只支持 `-f net10.0`**（已实测，传 `-f net8.0` 会失败退出码 127）。
+> 正确做法是**按模板默认生成，然后手工把 csproj 里的 `<TargetFramework>` 行整个删掉**，
+> 由 `Directory.Build.props` 统一提供 `net8.0-windows`。
+> 两个 csproj 都要处理：`PlcDataHub.Protocols.csproj` 与 `PlcDataHub.Protocols.Tests.csproj`。
+> 测试 csproj 还需删掉模板写入的 `<IsPackable>` 之外的样板并保留 `IsPackable=false`。
+
+> **⚠️ 实测陷阱二：项目若嵌套在子目录，必须在父 csproj 里排除。**
+> SDK 风格项目默认编译目录树下所有 `.cs`。本机实测把测试项目建在类库子目录时，
+> 类库会去编译测试源码并报 `未能找到类型或命名空间名 "Xunit"`，
+> 且错误指向**类库项目**，极易误判。
+> 本计划的结构里 `src\` 与 `tests\` 是平级的，不会触发；
+> 但若执行者改用嵌套布局，必须在父 csproj 加：
+> ```xml
+> <Compile Remove="tests\**" />
+> <None Remove="tests\**" />
+> ```
+
+然后把两个测试文件的内容按 Step 1 / Step 2 写入，删除模板生成的 `UnitTest1.cs` / `Class1.cs`。
 
 再运行：
 ```powershell
@@ -2839,8 +2938,8 @@ git commit -m "feat: Modbus TCP 连接与可编程假连接
 Run:
 ```powershell
 cd D:\deepseek\PLC_Collect
-dotnet new classlib -o src\PlcDataHub.Storage -f net8.0
-dotnet new xunit -o tests\PlcDataHub.Integration.Tests -f net8.0
+dotnet new classlib -o src\PlcDataHub.Storage
+dotnet new xunit -o tests\PlcDataHub.Integration.Tests --no-restore
 dotnet sln add src\PlcDataHub.Storage\PlcDataHub.Storage.csproj tests\PlcDataHub.Integration.Tests\PlcDataHub.Integration.Tests.csproj
 dotnet add src\PlcDataHub.Storage reference src\PlcDataHub.Core
 dotnet add tests\PlcDataHub.Integration.Tests reference src\PlcDataHub.Storage
@@ -2850,8 +2949,9 @@ dotnet add src\PlcDataHub.Storage package Npgsql
 dotnet add tests\PlcDataHub.Integration.Tests package FluentAssertions --version 6.12.1
 ```
 
-然后**删除两个 csproj 里模板自动生成的 `<TargetFramework>` 行**（由 `Directory.Build.props` 统一提供），
-删除模板文件 `Class1.cs` / `UnitTest1.cs`。
+> **同样不要加 `-f net8.0`**（.NET 10 SDK 模板不支持，见 Task 6 Step 3 的实测说明）。
+> 然后**删掉两个 csproj 里模板生成的 `<TargetFramework>` 行**（由 `Directory.Build.props` 统一提供），
+> 删除模板文件 `Class1.cs` / `UnitTest1.cs`。
 
 - [ ] **Step 2: 写 `TestDatabase`（集成测试的门槛）**
 
