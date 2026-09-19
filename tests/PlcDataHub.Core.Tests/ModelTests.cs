@@ -32,4 +32,19 @@ public class ModelTests
         DeviceConnection.DefaultPortFor(ProtocolKind.S7).Should().Be(102);
         DeviceConnection.DefaultPortFor(ProtocolKind.ModbusTcp).Should().Be(502);
     }
+
+    [Fact]
+    public void Modbus_RTU_没有端口概念_默认端口为_0()
+    {
+        // 0 的语义是"不适用"（RTU 走串口），不是 TCP 语义里的"任意端口"。
+        DeviceConnection.DefaultPortFor(ProtocolKind.ModbusRtu).Should().Be(0);
+    }
+
+    [Fact]
+    public void 未定义的协议值应抛出_ArgumentOutOfRangeException()
+    {
+        Action act = () => DeviceConnection.DefaultPortFor((ProtocolKind)999);
+
+        act.Should().Throw<ArgumentOutOfRangeException>();
+    }
 }
