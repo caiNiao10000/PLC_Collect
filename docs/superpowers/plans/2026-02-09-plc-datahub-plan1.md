@@ -670,7 +670,7 @@ Run:
 ```powershell
 dotnet test tests\PlcDataHub.Core.Tests
 ```
-Expected: `Passed! - Failed: 0, Passed: 3`
+Expected: `Passed! - Failed: 0, Passed: 4`（含 Task 1 的 2 条框架断言：Task 1 遗留 2 + 本任务新增 2 = 4。原文写 3 是漏算了 Task 1 Step 5b 把框架测试由 1 条扩成 2 条。）
 
 - [ ] **Step 5: 提交**
 
