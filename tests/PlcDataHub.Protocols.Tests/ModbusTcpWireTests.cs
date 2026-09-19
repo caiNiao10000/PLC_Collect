@@ -184,6 +184,15 @@ public class ModbusTcpWireTests
 
         result.Values.Should().ContainSingle().Which.Value.Should().BeNull();
         connection.IsConnected.Should().BeFalse("读超时属于传输层故障，必须让采集器去重连");
+
+        // 这两条同时验证两件事：① LastError 在真实链路上也被填充（修复 4）；
+        // ② 白名单里必须有 IOException——NModbus 同步读在"从站收包不回"时最终抛出的就是它，
+        //    若白名单漏了它，这个异常会冒泡出 ReadAsync（而不是被识别成传输故障、标坏点）。
+        connection.LastError.Should().NotBeNull();
+        connection.LastError!.Kind.Should().Be(ConnectionFailureKind.Transport);
+        connection.LastError.Message.Should().Contain(
+            nameof(IOException),
+            "实测：从站不回包时 NModbus 同步读抛出 IOException——本用例就是这条实测的载体");
     }
 
     [Fact]
@@ -208,6 +217,10 @@ public class ModbusTcpWireTests
             + $"实际是 {exception!.GetType().Name}：{exception.Message}");
 
         connection.IsConnected.Should().BeFalse();
+
+        connection.LastError.Should().NotBeNull("连接失败的原因必须留痕，否则 Plan 2 的状态里只剩一句'连不上'");
+        connection.LastError!.Kind.Should().Be(ConnectionFailureKind.Transport);
+        connection.LastError.Message.Should().Contain(port.ToString(), "消息里要带上是哪个地址连不上");
     }
 
     [Fact]

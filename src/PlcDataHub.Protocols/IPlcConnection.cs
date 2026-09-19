@@ -28,8 +28,47 @@ public sealed record ReadBlock(int StartAddress, int Length, IReadOnlyList<Point
 public sealed record ReadResult(IReadOnlyDictionary<PointConfig, object?> Values);
 
 /// <summary>
+/// 失败的类别。存在的理由是**让"点一直坏值"可归因**：
+/// 两类失败的处置完全相反——一类要改配置，一类要等链路/重连。
+/// </summary>
+public enum ConnectionFailureKind
+{
+    /// <summary>
+    /// 从站/设备**答复了拒绝**（Modbus 的异常码，如 01 不支持该功能码、02 地址超设备范围）。
+    /// 链路是好的，坏的是请求或地址配置：**不该重连**，该检查配置。
+    /// 这类失败在规格 5.3 节下被降级为坏点，因此必须由 <see cref="IPlcConnection.LastError"/> 留痕，
+    /// 否则它与"偶发读失败"完全不可区分。
+    /// </summary>
+    SlaveRejected,
+
+    /// <summary>
+    /// 传输层故障（超时、连接被重置、读写失败、传输对象已释放）。链路不可用：**该重连**。
+    /// </summary>
+    Transport,
+}
+
+/// <summary>最近一次失败的摘要：类别 + 可读消息（消息里应包含点标识或从站/地址等定位信息）。</summary>
+/// <param name="Kind">失败类别，决定上层该"改配置"还是"重连"。</param>
+/// <param name="Message">失败消息。必须能回答"哪里错了"，供 Plan 2 写入 <c>rt.group_status</c>。</param>
+public sealed record ConnectionFailure(ConnectionFailureKind Kind, string Message);
+
+/// <summary>
 /// 协议抽象。规格 5.1 节：一条连接由一个线程独占，绝不并发访问同一实例。
 /// </summary>
+/// <remarks>
+/// <para>
+/// <b>失败与重连的契约（跨任务约定，Plan 2 的采集器按此实现）</b>：
+/// <list type="number">
+///   <item><see cref="ConnectAsync"/> 失败抛异常，由采集器的重连逻辑处理；失败也会写入 <see cref="LastError"/>。</item>
+///   <item><see cref="ReadAsync"/> 单轮内的**块级**失败不抛异常：该块的点值为 null，其余块照常；失败写入 <see cref="LastError"/>。</item>
+///   <item>传输层故障会把 <see cref="IsConnected"/> 置 false，此后 <see cref="ReadAsync"/> **抛
+///         <see cref="InvalidOperationException"/>**（"尚未连接"），采集器必须重新
+///         <see cref="ConnectAsync"/> 才能继续——**不要**在一个已判定失效的连接上继续读。</item>
+///   <item>配置错误（不支持的数据类型、非法地址等）**抛异常且不写 LastError**：它们在使用前就暴露，
+///         异常本身就是信号（消息里带点标识）。</item>
+/// </list>
+/// </para>
+/// </remarks>
 public interface IPlcConnection : IDisposable
 {
     /// <summary>建立连接。失败抛异常，由采集器的重连逻辑处理。</summary>
@@ -40,4 +79,15 @@ public interface IPlcConnection : IDisposable
 
     /// <summary>当前是否处于已连接状态。</summary>
     bool IsConnected { get; }
+
+    /// <summary>
+    /// 最近一次失败的摘要；从未失败过时为 null。
+    /// <para>
+    /// **语义是"最近一次"（粘性），成功的一轮不会清空它**：清空会让"上周期出过错"在运行状态里消失，
+    /// 而操作员要看的正是"有没有出过错、错在哪一类"。要判断"此刻是否正常"请看 <see cref="IsConnected"/>
+    /// 与本轮的返回值。
+    /// </para>
+    /// <para>不抛异常的失败（从站拒绝、传输故障）**必须**写入本属性；抛异常的失败也应写入。</para>
+    /// </summary>
+    ConnectionFailure? LastError { get; }
 }

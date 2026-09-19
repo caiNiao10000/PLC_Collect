@@ -63,27 +63,57 @@ public sealed record ModbusTcpOptions(
 /// <list type="table">
 ///   <listheader><term>异常</term><description>处置与理由</description></listheader>
 ///   <item><term><see cref="ArgumentOutOfRangeException"/> / <see cref="NotSupportedException"/>（配置错误）</term>
-///         <description><b>在发出任何请求之前</b>对全部点校验并直接抛出（见 <see cref="EnsurePointAddressable"/>），
-///         使"这个配置永远不可能工作"不至于被伪装成"本周期读失败"。</description></item>
+///         <description><b>在发出任何请求之前</b>对全部点校验并直接抛出
+///         （见 <see cref="ModbusAddressValidator.EnsureAddressable"/>），
+///         使"这个配置永远不可能工作"不至于被伪装成"本周期读失败"。
+///         **这类检查包含 Dtl / String**：它们能通过规划（占 4 / 1 个寄存器），若留到解码期才抛，
+///         异常会发生在一次白发的请求之后、且不含点标识。</description></item>
 ///   <item><term><see cref="SlaveException"/></term>
 ///         <description>从站**答复了**异常码（如非法数据地址）：链路是好的，坏的是这个块的请求。
-///         该块的点写 NULL，<b>连接保持 IsConnected = true</b>——否则采集器会每周期无谓重连一次。</description></item>
-///   <item><term>其它异常（超时/连接被重置/帧错误…）</term>
-///         <description>该块的点写 NULL、<b>IsConnected 置 false</b>（交给重连逻辑），同一轮的其它块照常尝试。</description></item>
+///         该块的点写 NULL，<b>连接保持 IsConnected = true</b>——否则采集器会每周期无谓重连一次。
+///         同时写入 <see cref="LastError"/>（类别 <see cref="ConnectionFailureKind.SlaveRejected"/>），
+///         否则"某点每周期静默 NULL"与"偶发读失败"完全不可区分。</description></item>
+///   <item><term>传输类异常（超时/连接被重置/读写失败…）</term>
+///         <description>该块的点写 NULL、<b>IsConnected 置 false</b>、写入 <see cref="LastError"/>；
+///         **本轮剩余块一律不再发请求**（见 <see cref="ReadAsync"/> 的 linkDown 说明），
+///         之后必须重新 <see cref="ConnectAsync"/> 才能继续读。</description></item>
 /// </list>
 /// 取消（<see cref="OperationCanceledException"/>）与上述三者都不同：<b>一律冒泡</b>，它不是"这个点本轮坏了"。
+/// **白名单之外**的异常同样冒泡：用 catch-all 把它们伪装成"本块偶发读失败"会让库/代码缺陷永远失去信号。
+/// </para>
+/// <para>
+/// <b>IsConnected 的恢复语义（只有 <see cref="ConnectAsync"/> 能把它置回 true）</b>：
+/// 一次传输失败就意味着"这条连接对象不可再信"——**读超时后从站可能仍会把那次响应发回来**，
+/// 复用同一个 socket 会让下一个请求捡到上一条迟到帧（错值且不报错）。
+/// 故：传输失败 → <c>IsConnected = false</c> → 下一轮 <see cref="ReadAsync"/> **抛
+/// <see cref="InvalidOperationException"/>**（"尚未连接，不能读取"）→ 采集器的重连逻辑
+/// 必须重新 <see cref="ConnectAsync"/>（它内部会释放旧 socket 并新建）。
+/// **不存在"块失败后继续在同一 socket 上读下一轮"的路径**，因此也不会有"标死却还在用"的自相矛盾。
 /// </para>
 /// <para>
 /// <b>返回的是原始值</b>：未乘 Scale、未加 Offset（规格 3.4 节要求工程值转换在落库前完成）。
+/// </para>
+/// <para>
+/// <b>已知限制（模型缺口，不在连接层做特例）</b>：
+/// <list type="bullet">
+///   <item><b>1 字节类型固定取寄存器的高字节</b>：<c>Byte</c>/<c>SInt</c>/<c>USInt</c> 在寄存器区的
+///         字节偏移是 0，即寄存器大端拆字节后的**首字节（高字节）**；而 <c>ByteOrder</c> 对 1 字节类型
+///         无意义（<see cref="ByteDecoder"/> 里 1 字节分支不取字节序）。若现场设备把单字节值放在寄存器的
+///         **低**字节，本模型**表达不出来**——需要把它声明成 <c>WORD</c> 后在别处取舍，或扩模型。
+///         这与 word-swapped 属同一类缺口，属规格 8.1 节登记的限制。</item>
+///   <item><b>寄存器区非 BOOL 点的 BitOffset 被忽略</b>：它只在 BOOL 点上有意义（见
+///         <see cref="ModbusAddress"/>）。刻意不报错——那份配置只是冗余，不产生错值，
+///         见 <see cref="ModbusAddressValidator"/> 的说明。</item>
+/// </list>
 /// </para>
 /// </remarks>
 public sealed class ModbusTcpConnection : IPlcConnection
 {
     /// <summary>规格 3.2 节 <c>mb_slave</c> 的合法下界。0 是广播地址，不能用于读取。</summary>
-    public const int MinSlaveId = 1;
+    public const int MinSlaveId = ModbusAddressValidator.MinSlaveId;
 
     /// <summary>规格 3.2 节 <c>mb_slave</c> 的合法上界。248~255 保留。</summary>
-    public const int MaxSlaveId = 247;
+    public const int MaxSlaveId = ModbusAddressValidator.MaxSlaveId;
 
     /// <summary>功能码 03/04 单次最多读 125 个寄存器（响应字节数域只有 1 字节，最多 250 字节数据）。</summary>
     public const int MaxRegistersPerModbusRequest = 125;
@@ -150,15 +180,19 @@ public sealed class ModbusTcpConnection : IPlcConnection
 
     public bool IsConnected { get; private set; }
 
+    /// <inheritdoc />
+    public ConnectionFailure? LastError { get; private set; }
+
     /// <summary>
-    /// 建立连接。失败抛异常（含超时抛 <see cref="TimeoutException"/>），由采集器的重连逻辑处理。
+    /// 建立连接。失败抛异常（含超时抛 <see cref="TimeoutException"/>），由采集器的重连逻辑处理；
+    /// 失败原因同时写入 <see cref="LastError"/>（类别恒为 <see cref="ConnectionFailureKind.Transport"/>）。
     /// </summary>
     public async Task ConnectAsync(CancellationToken cancellationToken)
     {
         if (_injectedChannel is not null)
         {
-            // 测试注入路径：不建 socket，也不在这里释放注入的通道——它的生命周期归测试所有，
-            // 在此释放会让"重复 ConnectAsync"把测试桩一起释放掉。
+            // 测试注入路径：不建 socket，也不在这里释放注入的通道——重复 ConnectAsync 会把测试桩释放掉。
+            // 注入通道随本对象的 Dispose 释放（测试正是靠 stub.DisposeCount 断言释放行为）。
             _channel = _injectedChannel;
             IsConnected = true;
             return;
@@ -178,13 +212,25 @@ public sealed class ModbusTcpConnection : IPlcConnection
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
             client.Dispose();
-            throw new TimeoutException(
+
+            var timeout = new TimeoutException(
                 $"连接 {_connection.Host}:{_connection.Port} 超时（{_options.TimeoutMs} ms）");
+            LastError = new ConnectionFailure(ConnectionFailureKind.Transport, timeout.Message);
+            throw timeout;
         }
-        catch
+        catch (OperationCanceledException)
         {
-            // 连接失败（拒绝/不可达/调用方取消）也要把 socket 放掉，否则句柄泄漏。
+            // 调用方取消：不是连接的失败，不写 LastError。
             client.Dispose();
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // 连接失败（拒绝/不可达）也要把 socket 放掉，否则句柄泄漏；原因留痕供运行状态展示。
+            client.Dispose();
+            LastError = new ConnectionFailure(
+                ConnectionFailureKind.Transport,
+                $"连接 {_connection.Host}:{_connection.Port} 失败：{ex.GetType().Name}: {ex.Message}");
             throw;
         }
 
@@ -202,14 +248,24 @@ public sealed class ModbusTcpConnection : IPlcConnection
     /// 读取一组点。返回的字典为每个传入的点都给出条目；失败的点、以及不属于本连接协议的点
     /// （<see cref="PointConfig.Modbus"/> 为 null）值为 null。
     /// </summary>
-    /// <exception cref="InvalidOperationException">尚未连接。</exception>
+    /// <remarks>
+    /// <b>传输故障后本轮不再发请求</b>：首个传输类失败会把本轮标记为"链路已失效"，
+    /// 剩余块**直接标坏点、不再发请求**。否则每个块都要各自等满
+    /// <see cref="ModbusTcpOptions.TimeoutMs"/> × NModbus 的重试（默认 3 次重试 + 250ms 间隔），
+    /// 一轮十块能拖到几十秒，而这期间没有任何信号。
+    /// 之后 <see cref="IsConnected"/> 为 false，下次调用本方法会抛 <see cref="InvalidOperationException"/>，
+    /// 采集器必须重新 <see cref="ConnectAsync"/>（理由见类注释的"IsConnected 的恢复语义"）。
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">尚未连接（含上一轮发生过传输故障的情形）。</exception>
     /// <exception cref="ArgumentNullException"><paramref name="points"/> 为 null。</exception>
     /// <exception cref="ArgumentOutOfRangeException">
-    /// 某个点的从站号不在 1~247、寄存器地址越界、或位偏移越界（见 <see cref="EnsurePointAddressable"/>）。
+    /// 某个点的从站号不在 1~247、寄存器地址越界、或位偏移越界
+    /// （见 <see cref="ModbusAddressValidator.EnsureAddressable"/>）。
     /// </exception>
     /// <exception cref="NotSupportedException">
-    /// 某个点的类型与寄存器区组合无法读取（位区里的非 BOOL 点），或该点类型本期不支持解码
-    /// （<see cref="PointDataType.Dtl"/> / <see cref="PointDataType.String"/>，由 <see cref="ByteDecoder"/> 抛出）。
+    /// 某个点的类型与寄存器区组合无法读取（位区里的非 BOOL 点），或该点类型本期不支持
+    /// （<see cref="PointDataType.Dtl"/> / <see cref="PointDataType.String"/>）。
+    /// 两者都在**配置期**（发出任何请求之前）抛出，且消息点名到点。
     /// 这类异常**不会被逐块故障隔离吞掉**——它们是配置错误。
     /// </exception>
     /// <exception cref="OperationCanceledException">调用方取消。</exception>
@@ -242,9 +298,12 @@ public sealed class ModbusTcpConnection : IPlcConnection
                 continue;
             }
 
-            EnsurePointAddressable(point);
+            ModbusAddressValidator.EnsureAddressable(point);
             modbusPoints.Add(point);
         }
+
+        // 本轮链路是否已被判定失效。一旦为 true，剩余块只标坏点、不再发请求（见 ReadAsync 的 remarks）。
+        var linkDown = false;
 
         foreach (var group in modbusPoints.GroupBy(p => (p.Modbus!.SlaveId, p.Modbus!.Area)))
         {
@@ -261,7 +320,20 @@ public sealed class ModbusTcpConnection : IPlcConnection
                          _options.MaxRegistersPerRequest))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                ReadBlockInto(channel, slaveId, area, block, values);
+
+                if (linkDown)
+                {
+                    // 链路已判定失效：**不发请求**。否则每个剩余块都要各自等满
+                    // TimeoutMs × NModbus 重试（默认 3 次 + 250ms 间隔 ≈ 单块 4.75s），
+                    // 一轮十块能拖到几十秒，期间没有任何信号。
+                    MarkBlockPointsBad(block, values);
+                    continue;
+                }
+
+                if (!ReadBlockInto(channel, slaveId, area, block, values))
+                {
+                    linkDown = true;
+                }
             }
         }
 
@@ -283,112 +355,13 @@ public sealed class ModbusTcpConnection : IPlcConnection
     }
 
     /// <summary>
-    /// 地址与类型校验。**在发出任何请求之前**对全部 Modbus 点跑一遍，任何一条不满足都响亮抛出。
-    /// </summary>
-    /// <remarks>
-    /// <para>
-    /// 每一条规则都对应一条真实的静默失效路径（不校验的后果都是"读到错值/永远坏值且没有信号"）：
-    /// <list type="number">
-    ///   <item><b>从站号越界</b>（C4）：<c>(byte)slaveId</c> 直接截断时，0（广播）与 248~255
-    ///         会被编码成一个看起来合法的请求字节，从站不会拒绝——于是读到别处的数据而不报错。</item>
-    ///   <item><b>寄存器地址越界</b>：地址要经 <c>(ushort)</c> 落到请求里，超出 0~65535 会被截断，
-    ///         请求打到完全不相干的寄存器上。</item>
-    ///   <item><b>点的末寄存器越界</b>：地址合法但"地址 + 宽度 - 1"越过 65535 时，
-    ///         块尾回绕，最后一个点读到块首附近的数据。</item>
-    ///   <item><b>寄存器区未定义</b>：枚举被强转成未定义值时，功能码选择会落到某个默认分支。</item>
-    ///   <item><b>位区里放了非 BOOL 点</b>：线圈/离散输入每个地址只有一位，WORD 在这里无法表达；
-    ///         若按寄存器路径去读，会拿线圈的地址空间去发功能码 03/04——那是另一个编号空间。</item>
-    ///   <item><b>位区里的 BitOffset 不为 0</b>：位区本身已按位寻址，位偏移无处可用；
-    ///         静默忽略它等于"配置说取第 3 位、实际取了第 0 位"。</item>
-    ///   <item><b>寄存器区 BOOL 的 BitOffset 越界</b>：不在 0~15 时位提取返回 null，
-    ///         该点每个周期都是坏值且没有任何错误信号。</item>
-    /// </list>
-    /// </para>
-    /// <para>
-    /// 异常分两类，Plan 2 的采集器若要按点隔离配置错误，catch 这两个类型即可：
-    /// <see cref="ArgumentOutOfRangeException"/>（取值问题，<c>ParamName</c> 一律是 <c>points</c>，
-    /// 与规划器对"点宽度超过上限"的处置同型）与 <see cref="NotSupportedException"/>
-    /// （类型组合不支持，与 <see cref="ByteDecoder"/> 对 Dtl/String 的处置同型）。
-    /// </para>
-    /// </remarks>
-    private static void EnsurePointAddressable(PointConfig point)
-    {
-        var modbus = point.Modbus!;
-        var where = $"采集点 {point.PointCode}（{point.PointName}）";
-
-        if (modbus.SlaveId is < MinSlaveId or > MaxSlaveId)
-        {
-            throw new ArgumentOutOfRangeException(
-                "points", modbus.SlaveId,
-                $"{where} 的从站号 {modbus.SlaveId} 超出 {MinSlaveId}~{MaxSlaveId}（规格 3.2 节 mb_slave）。"
-                + "0 是广播地址、248~255 保留，它们会被编码成一个看起来合法的请求字节，"
-                + "于是读到别的从站的数据而不会报错。请把从站号改为 1~247。");
-        }
-
-        switch (modbus.Area)
-        {
-            case ModbusRegisterArea.Coil:
-            case ModbusRegisterArea.DiscreteInput:
-                if (point.DataType != PointDataType.Bool)
-                {
-                    throw new NotSupportedException(
-                        $"{where} 位于 {modbus.Area}（位区），每个地址只有一位，无法表达数据类型 {point.DataType}。"
-                        + "位区只能配置 Bool 点；若该点确实是 16 位量，请把它改到保持寄存器/输入寄存器区。");
-                }
-
-                if (modbus.BitOffset != 0)
-                {
-                    throw new ArgumentOutOfRangeException(
-                        "points", modbus.BitOffset,
-                        $"{where} 位于 {modbus.Area}（位区），按位寻址——一个线圈/离散输入就是一位，"
-                        + $"BitOffset 必须为 0，实际为 {modbus.BitOffset}。静默忽略它会让'配置说取第 {modbus.BitOffset} 位、"
-                        + "实际取了该地址本身'。");
-                }
-
-                break;
-
-            case ModbusRegisterArea.HoldingRegister:
-            case ModbusRegisterArea.InputRegister:
-                if (point.DataType == PointDataType.Bool && modbus.BitOffset is < 0 or > 15)
-                {
-                    throw new ArgumentOutOfRangeException(
-                        "points", modbus.BitOffset,
-                        $"{where} 是 {modbus.Area} 区的 Bool 点，寄存器内的位偏移必须在 0~15，实际为 {modbus.BitOffset}。"
-                        + "越界的位偏移取不出任何位（该点会每周期写坏值）。");
-                }
-
-                break;
-
-            default:
-                throw new ArgumentOutOfRangeException(
-                    "points", modbus.Area,
-                    $"{where} 的寄存器区 {modbus.Area}（{(int)modbus.Area}）不是已定义的值，无法确定读取用的功能码。");
-        }
-
-        if (modbus.RegisterAddress < 0)
-        {
-            throw new ArgumentOutOfRangeException(
-                "points", modbus.RegisterAddress,
-                $"{where} 的地址 {modbus.RegisterAddress} 为负。Modbus 地址是 0 基的无符号 16 位量，"
-                + "负值被转成 ushort 后会打到完全不相干的地址上。");
-        }
-
-        var width = ReadBlockPlanner.RegisterWidth(point);
-        var lastRegister = modbus.RegisterAddress + width - 1;
-
-        if (lastRegister > ushort.MaxValue)
-        {
-            throw new ArgumentOutOfRangeException(
-                "points", modbus.RegisterAddress,
-                $"{where} 的地址 {modbus.RegisterAddress} 加上它占用的 {width} 个寄存器后，末寄存器地址 {lastRegister} "
-                + $"越过 Modbus 地址上限 {ushort.MaxValue}，请求会回绕到块首附近，静默读到错的数据。");
-        }
-    }
-
-    /// <summary>
     /// 读一个块并按区走对应的物理路径；逐块做故障隔离。
     /// </summary>
-    private void ReadBlockInto(
+    /// <returns>
+    /// <c>true</c> = 链路仍可用（**含"从站用异常码拒绝了本块"**——从站答复了就说明链路是好的）；
+    /// <c>false</c> = 传输层故障，调用方必须停止本轮剩余块的读取（见 <see cref="ReadAsync"/> 的 linkDown）。
+    /// </returns>
+    private bool ReadBlockInto(
         IModbusRequestChannel channel,
         byte slaveId,
         ModbusRegisterArea area,
@@ -410,12 +383,14 @@ public sealed class ModbusTcpConnection : IPlcConnection
                     break;
 
                 default:
-                    // 已由 EnsurePointAddressable 拦下。这里再抛一次，是为了将来给 ModbusRegisterArea
+                    // 已由 ModbusAddressValidator 拦下。这里再抛一次，是为了将来给 ModbusRegisterArea
                     // 加新枚举值时不会"默默用错功能码去读"——而它会被下面的 NotSupportedException
                     // 分支原样冒泡，绝不会变成 NULL。
                     throw new NotSupportedException(
                         $"未知的寄存器区 {area}（{(int)area}），无法确定读取用的功能码。");
             }
+
+            return true;
         }
         catch (OperationCanceledException)
         {
@@ -426,22 +401,67 @@ public sealed class ModbusTcpConnection : IPlcConnection
         {
             // 配置错误必须冒泡，绝不能在这里变成 NULL：把"这个配置永远不可能工作"伪装成
             // "偶发读取失败"，正是本项目最怕的失效（该点每周期静默写坏值、没有任何信号）。
+            // 正常路径不可达（配置期已把这些配置拦下），保留为**第二道防线**：
+            // 它拦的是"绕过配置校验直接调用通道"的将来代码，以及库自己抛出的同类型异常。
+            //
+            // 实测（修复轮 1 变异 R11）：**在当前传输白名单下，删掉本分支测试仍全绿**——
+            // NotSupportedException 不在白名单里，没有别的 catch 会接住它，它本来就会冒泡。
+            // 保留它的理由只有一条，但是真实的：本分支位于传输白名单分支**之前**，
+            // 若将来有人把 NotSupportedException 误加进白名单、或在后面补一个 catch-all，
+            // 这里仍会先把它拦住。该性质由 `读通道抛出_NotSupportedException_时不被吞成坏点` 覆盖。
             throw;
         }
-        catch (SlaveException)
+        catch (SlaveException ex)
         {
             // 从站答复了异常码（例如非法数据地址 0x02）：设备与链路都是好的，坏的是这个块的请求。
             // 标记整条连接断开会让采集器每周期做一次无谓的重连。
+            // 但"不重连"不等于"不留痕"：异常码 01/02 恰是现场最常见的**配置**错误形态，
+            // 若只写 NULL，它就和偶发读失败完全不可区分 → 必须写 LastError。
+            LastError = new ConnectionFailure(
+                ConnectionFailureKind.SlaveRejected,
+                $"从站 {slaveId} 拒绝了 {area} 区的读块（起始 {block.StartAddress}，长度 {block.Length}）："
+                + $"从站异常码 {ex.SlaveExceptionCode}（功能码 {ex.FunctionCode}）。"
+                + "链路是好的，请检查该块的地址/寄存器区配置。");
+
             MarkBlockPointsBad(block, values);
+            return true;
         }
-        catch (Exception)
+        catch (Exception ex) when (IsTransportFailure(ex))
         {
-            // 传输层故障（超时/连接被重置/帧错误…）：链路已不可用 → 标记断开，交给重连逻辑。
-            // 同一轮的其它块照常尝试：单块失败只影响该块（规格 5.3 节）。
+            // 传输层故障：链路已不可用 → 标记断开 + 留痕，并让调用方停止本轮剩余块。
+            LastError = new ConnectionFailure(
+                ConnectionFailureKind.Transport,
+                $"从站 {slaveId} 的 {area} 区读块（起始 {block.StartAddress}，长度 {block.Length}）传输失败："
+                + $"{ex.GetType().Name}: {ex.Message}");
+
             IsConnected = false;
             MarkBlockPointsBad(block, values);
+            return false;
         }
+
+        // 这里刻意**没有** catch-all：不在白名单里的异常一律冒泡。
+        // catch-all 会把库/代码缺陷（例如 NModbus 的参数校验失败、序列化错误）伪装成
+        // "本块偶发读失败"，让缺陷永远只表现为"某些点没数据"——与 C2 是同一类失效。
     }
+
+    /// <summary>
+    /// 传输层故障的**白名单**。
+    /// </summary>
+    /// <remarks>
+    /// 四个成员都是"链路/连接对象坏了"的形态：
+    /// <list type="bullet">
+    ///   <item><see cref="TimeoutException"/>：读超时，以及本类 <see cref="ConnectAsync"/> 自己包装出的超时；</item>
+    ///   <item><see cref="IOException"/>：<c>NetworkStream</c> 读写失败，含 .NET 把 socket 读超时包装成的 IOException
+    ///         （**实测**：从站收包不回时 NModbus 同步读最终抛出的就是这个，见
+    ///         <c>端到端_从站不回包时读超时_该块坏点且连接被标记断开</c>）；</item>
+    ///   <item><see cref="SocketException"/>：socket 级失败（连接被重置等）；</item>
+    ///   <item><see cref="ObjectDisposedException"/>：传输对象已被释放（与 <see cref="Dispose"/> 竞态的形态）。</item>
+    /// </list>
+    /// **用白名单而不是 catch-all**：多列出一种"其实不是传输故障"的异常，就等于把它伪装成坏点。
+    /// 漏列的代价是异常冒泡（响亮、可归因），比静默错值/静默坏值好。
+    /// </remarks>
+    private static bool IsTransportFailure(Exception ex) =>
+        ex is TimeoutException or IOException or SocketException or ObjectDisposedException;
 
     /// <summary>
     /// 位区读取（功能码 01 线圈 / 02 离散输入）。
@@ -507,6 +527,13 @@ public sealed class ModbusTcpConnection : IPlcConnection
             bytes[i * 2 + 1] = (byte)(registers[i] & 0xFF);
         }
 
+        // 解码这一步可能抛的 NotSupportedException（Dtl / String）是**第二道防线**：正常路径不可达——
+        // ModbusAddressValidator 已在配置期把这两个类型拦下（fail-fast、消息带点标识、且不白花一次请求）。
+        // 保留解码层的这道检查，是为了拦住"绕过配置校验直接调解码"的将来代码；
+        // 对应的异常分支（catch (NotSupportedException) → throw）也一并保留，绝不把它降级成坏点。
+        //
+        // 另注：**非 BOOL 点的 BitOffset 在这里不参与寻址**（它只在寄存器区的 BOOL 点上有意义，
+        // 见类注释的已知限制）——这是刻意的宽容，不是遗漏。
         foreach (var point in block.Points)
         {
             var modbus = point.Modbus!;

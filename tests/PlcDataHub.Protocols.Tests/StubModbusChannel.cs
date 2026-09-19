@@ -37,6 +37,9 @@ internal sealed class StubModbusChannel : IModbusRequestChannel
     internal void FailWith(byte slaveId, ModbusRegisterArea area, Func<Exception> exceptionFactory) =>
         _failures[(slaveId, area)] = exceptionFactory;
 
+    /// <summary>清掉失败注入，让读取恢复正常（用于"失败一轮后再成功一轮"的用例）。</summary>
+    internal void ClearFailures() => _failures.Clear();
+
     public bool[] ReadCoils(byte slaveId, ushort startAddress, ushort quantity) =>
         ReadBits(slaveId, ModbusRegisterArea.Coil, startAddress, quantity);
 

@@ -236,8 +236,11 @@ public class ModbusTcpConnectionTests
     // ================= 逐块故障隔离（规格 5.3 节） =================
 
     [Fact]
-    public async Task 一个从站读失败不影响另一个从站的点()
+    public async Task 一个从站读失败不影响另一个从站已读到的值()
     {
+        // **数据隔离**：失败组在后时，本轮已经从另一组读到的值不会被"整轮作废"。
+        // 注意范围：传输故障会把链路标死，**本轮的后续块**不再发请求（见
+        // `首个传输失败后_本轮剩余块不再发请求`）；这里保留的是"已读到的数据不丢"。
         var stub = new StubModbusChannel();
         stub.SetRegisters(1, ModbusRegisterArea.HoldingRegister, 100, 0x0064);
         stub.FailWith(2, ModbusRegisterArea.HoldingRegister, () => new IOException("连接被重置"));
@@ -249,7 +252,7 @@ public class ModbusTcpConnectionTests
 
         result.Values[points[0]].Should().Be(100.0, "从站 1 的读块必须不受从站 2 失败的影响");
         result.Values[points[1]].Should().BeNull();
-        stub.Calls.Should().HaveCount(2, "两个从站都发过请求");
+        stub.Calls.Should().HaveCount(2, "两个从站都发过请求（失败组在最后，没有需要跳过的剩余块）");
     }
 
     [Fact]
@@ -266,30 +269,38 @@ public class ModbusTcpConnectionTests
     }
 
     [Fact]
-    public async Task 从站返回异常码只让该块变坏点_连接保持()
+    public async Task 从站异常码让该块变坏点_但不中止本轮_其余块照常读()
     {
         // 从站"答复了"异常码（例如非法数据地址 0x02）：设备与链路都是好的，坏的是这个块的请求。
         // 若把它也当成传输故障，采集器会每个周期无谓重连一次。
+        //
+        // **刻意把失败的从站放在第一个**：修复 2 引入的"链路失效即中止本轮"绝不能因此触发——
+        // 从站答复了异常码说明链路是好的，后面的块必须照常读。
         var stub = new StubModbusChannel();
         stub.SetRegisters(1, ModbusRegisterArea.HoldingRegister, 100, 0x0064);
         stub.FailWith(2, ModbusRegisterArea.HoldingRegister, () => new SlaveException("从站返回异常码 02（非法数据地址）"));
         using var connection = await ConnectedAsync(stub);
 
-        var points = new[] { Word(1, 100, slave: 1), Word(2, 100, slave: 2) };
+        var points = new[] { Word(1, 100, slave: 2), Word(2, 100, slave: 1) };
 
         var result = await connection.ReadAsync(points, CancellationToken.None);
 
-        result.Values[points[0]].Should().Be(100.0);
-        result.Values[points[1]].Should().BeNull();
+        result.Values[points[0]].Should().BeNull("被拒绝的从站其点是坏点");
+        result.Values[points[1]].Should().Be(100.0, "链路是好的，后面的块必须照常读（没有被中止）");
         connection.IsConnected.Should().BeTrue("从站答复了异常码，说明链路是好的");
+        stub.Calls.Should().HaveCount(2, "两个从站的请求都发出去了");
     }
 
     [Fact]
-    public async Task 配置错误不被吞成坏点_而是响亮抛出()
+    public async Task 配置错误不被吞成坏点_而是在配置期响亮抛出且不发请求()
     {
-        // Dtl 本期不支持解码（ByteDecoder 抛 NotSupportedException）。
-        // 若逐块故障隔离把它吞成 NULL，该点会**每个周期静默写坏值**且没有任何信号——
-        // 正是 brief 原始 catch-all 的缺陷（把"配置永远不可能工作"伪装成"偶发读取失败"）。
+        // Dtl 本期不支持。**关键在"何时"抛**：必须在任何 I/O 之前（配置期），而不是等解码期。
+        // 解码期抛有三个后果：① 异常发生在一次白发的请求之后；② 异常不含点标识
+        // （ByteDecoder 拿不到 PointConfig，结构上不可能点名）；③ 异常中断整轮。
+        //
+        // 行为差异（修复轮 1 明确确认）：含 Dtl 点的组现在**整组在配置期失败**，
+        // 而修复前是"请求发出去了、读到一半才整组没数据"。前者更好：错误在任何 I/O 之前、
+        // 以点名的方式暴露，而且是**每轮都一样**的确定性失败，不是随机的坏点形态。
         var stub = new StubModbusChannel();
         stub.SetRegisters(1, ModbusRegisterArea.HoldingRegister, 100, 0x0000, 0x0000, 0x0000, 0x0000, 0x0064);
         using var connection = await ConnectedAsync(stub);
@@ -305,8 +316,167 @@ public class ModbusTcpConnectionTests
 
         var act = async () => await connection.ReadAsync(points, CancellationToken.None);
 
-        await act.Should().ThrowAsync<NotSupportedException>().WithMessage("*Dtl*");
+        await act.Should().ThrowAsync<NotSupportedException>()
+            .WithMessage("*Dtl*")
+            .WithMessage("*dtl1*")
+            .WithMessage("*本期不支持*");
+        stub.Calls.Should().BeEmpty("配置错误必须在发出任何请求之前抛出（否则白花一次请求）");
         connection.IsConnected.Should().BeTrue("类型不支持是配置错误，不是链路故障");
+        connection.LastError.Should().BeNull("配置错误靠抛异常暴露，异常本身就是信号（不写 LastError）");
+    }
+
+    [Theory]
+    [InlineData(PointDataType.Dtl)]
+    [InlineData(PointDataType.String)]
+    public async Task 寄存器区的不支持类型点在配置期被拒绝(PointDataType type)
+    {
+        var stub = new StubModbusChannel();
+        using var connection = await ConnectedAsync(stub);
+
+        var act = async () => await connection.ReadAsync(new[] { Typed(7, type, 100) }, CancellationToken.None);
+
+        await act.Should().ThrowAsync<NotSupportedException>()
+            .WithMessage($"*{type}*")
+            .WithMessage("*p7*")
+            .WithMessage("*本期不支持*");
+        stub.Calls.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task 读通道抛出_NotSupportedException_时不被吞成坏点()
+    {
+        // 这是"逐块故障隔离绝不吞配置错误"这条性质的**机制守卫**。
+        // 配置期检查（上面两条用例）已经把 Dtl/String 挡在 I/O 之前，所以正常路径再也走不到
+        // 块级 catch 的 NotSupportedException 分支；但那个分支是第二道防线，必须继续有效。
+        // 这里直接从通道注入同类型异常，验证它冒泡而不是变成 NULL。
+        var stub = new StubModbusChannel();
+        stub.FailWith(1, ModbusRegisterArea.HoldingRegister, () => new NotSupportedException("模拟：库里抛出的不支持类型"));
+        using var connection = await ConnectedAsync(stub);
+
+        var act = async () => await connection.ReadAsync(new[] { Word(1, 100) }, CancellationToken.None);
+
+        await act.Should().ThrowAsync<NotSupportedException>().WithMessage("*模拟*");
+        connection.IsConnected.Should().BeTrue("把它当成链路故障会让采集器做无谓重连");
+    }
+
+    [Fact]
+    public async Task 白名单之外的异常不被吞成坏点_而是冒泡()
+    {
+        // catch-all 会把库/代码缺陷（例如 NModbus 的参数校验失败）伪装成"本块偶发读失败"，
+        // 让缺陷永远只表现为"某些点没数据"——与 C2 是同一类失效。故只认传输类白名单。
+        var stub = new StubModbusChannel();
+        stub.FailWith(1, ModbusRegisterArea.HoldingRegister, () => new InvalidOperationException("模拟：库内部状态错误"));
+        using var connection = await ConnectedAsync(stub);
+
+        var act = async () => await connection.ReadAsync(new[] { Word(1, 100) }, CancellationToken.None);
+
+        await act.Should().ThrowAsync<InvalidOperationException>().WithMessage("*库内部状态错误*");
+        connection.IsConnected.Should().BeTrue("未知异常不该顺带把连接标死");
+    }
+
+    // ================= 修复 2：首个传输失败后本轮不再发请求 =================
+
+    [Fact]
+    public async Task 首个传输失败后_本轮剩余块不再发请求()
+    {
+        // 两个块（同一从站同一区、地址相距很远 → 必然拆成两块）。
+        // 修复前：两块各自等满超时（NModbus 默认 3 次重试 + 250ms 间隔 ≈ 单块 4.75s，十块能拖到几十秒）。
+        // 修复后：第一个块失败即判定链路失效，第二个块直接标坏点、不发请求。
+        var stub = new StubModbusChannel();
+        stub.FailWith(1, ModbusRegisterArea.HoldingRegister, () => new IOException("模拟：连接被重置"));
+        using var connection = await ConnectedAsync(stub);
+
+        var points = new[] { Word(1, 100), Word(2, 3000) };
+
+        var result = await connection.ReadAsync(points, CancellationToken.None);
+
+        stub.Calls.Should().ContainSingle("链路失效后不得再发请求（否则每个块都要各自等满超时）");
+        result.Values[points[0]].Should().BeNull();
+        result.Values[points[1]].Should().BeNull("未发请求的块照样是坏点，条目不能少");
+        result.Values.Should().HaveCount(2);
+        connection.IsConnected.Should().BeFalse();
+        connection.LastError!.Kind.Should().Be(ConnectionFailureKind.Transport);
+    }
+
+    [Fact]
+    public async Task 传输失败后_下一轮读取直接抛异常而不复用可疑连接()
+    {
+        // IsConnected 的恢复语义：**只有 ConnectAsync 能置回 true**。
+        // 理由：读超时后从站可能仍把那次响应发回来，复用同一 socket 会让下一个请求捡到迟到帧
+        // （错值且不报错）。故传输失败后必须重新建连，而不是"继续读读看"。
+        var stub = new StubModbusChannel();
+        stub.FailWith(1, ModbusRegisterArea.HoldingRegister, () => new IOException("模拟：连接被重置"));
+        using var connection = await ConnectedAsync(stub);
+
+        await connection.ReadAsync(new[] { Word(1, 100) }, CancellationToken.None);
+        connection.IsConnected.Should().BeFalse();
+
+        var act = async () => await connection.ReadAsync(new[] { Word(1, 100) }, CancellationToken.None);
+
+        await act.Should().ThrowAsync<InvalidOperationException>().WithMessage("*尚未连接*");
+        stub.Calls.Should().ContainSingle("第二轮一个请求都不该发出去");
+    }
+
+    // ================= 修复 4：LastError（让"点一直坏值"可归因） =================
+
+    [Fact]
+    public async Task 从站异常码写入_LastError_而连接保持()
+    {
+        // 异常码 01（不支持该功能码）/ 02（地址超设备范围）恰是现场最常见的**配置**错误形态。
+        // 它们被降级为坏点是对的（链路是好的，不该重连），但**必须留痕**，
+        // 否则"某点每周期静默 NULL"与"偶发读失败"完全不可区分。
+        var stub = new StubModbusChannel();
+        stub.FailWith(1, ModbusRegisterArea.HoldingRegister, () => new SlaveException("从站返回异常码 02（非法数据地址）"));
+        using var connection = await ConnectedAsync(stub);
+
+        connection.LastError.Should().BeNull("还没读过，不该有失败记录");
+
+        var result = await connection.ReadAsync(new[] { Word(1, 100) }, CancellationToken.None);
+
+        result.Values.Should().ContainSingle().Which.Value.Should().BeNull();
+        connection.IsConnected.Should().BeTrue("从站答复了就说明链路是好的");
+
+        connection.LastError.Should().NotBeNull();
+        connection.LastError!.Kind.Should().Be(ConnectionFailureKind.SlaveRejected);
+        connection.LastError.Message.Should()
+            .Contain("HoldingRegister")
+            .And.Contain("100")
+            .And.Contain("请检查", "消息要能回答'该怎么办'——这类失败该改配置，不是重连");
+    }
+
+    [Fact]
+    public async Task 传输故障写入_LastError_类别为_Transport()
+    {
+        var stub = new StubModbusChannel();
+        stub.FailWith(1, ModbusRegisterArea.HoldingRegister, () => new TimeoutException("模拟：读超时"));
+        using var connection = await ConnectedAsync(stub);
+
+        await connection.ReadAsync(new[] { Word(1, 100) }, CancellationToken.None);
+
+        connection.LastError.Should().NotBeNull();
+        connection.LastError!.Kind.Should().Be(ConnectionFailureKind.Transport);
+        connection.LastError.Message.Should().Contain("TimeoutException").And.Contain("读超时");
+    }
+
+    [Fact]
+    public async Task 成功的一轮不清空_LastError()
+    {
+        // "最近一次失败"是**粘性**语义：清空会让"上周期出过错"在运行状态里消失，
+        // 而操作员要看的正是"有没有出过错、错在哪一类"。
+        var stub = new StubModbusChannel();
+        stub.SetRegisters(1, ModbusRegisterArea.HoldingRegister, 100, 0x0064);
+        stub.FailWith(1, ModbusRegisterArea.HoldingRegister, () => new SlaveException("拒绝"));
+        using var connection = await ConnectedAsync(stub);
+
+        await connection.ReadAsync(new[] { Word(1, 100) }, CancellationToken.None);
+        var first = connection.LastError;
+        first.Should().NotBeNull();
+
+        stub.ClearFailures();
+        var result = await connection.ReadAsync(new[] { Word(1, 100) }, CancellationToken.None);
+
+        result.Values.Should().ContainSingle().Which.Value.Should().Be(100.0);
+        connection.LastError.Should().BeSameAs(first, "成功不清空 LastError（粘性语义）");
     }
 
     // ================= C4：从站号边界与地址校验 =================
@@ -665,6 +835,10 @@ public class ModbusTcpConnectionTests
 
     private static PointConfig Bool(int id, int register, int bitOffset, int slave = 1) =>
         Point(id, PointDataType.Bool, slave, ModbusRegisterArea.HoldingRegister, register, bitOffset);
+
+    /// <summary>指定数据类型的寄存器区点（用于 Dtl / String 这类"本期不支持"的用例）。</summary>
+    private static PointConfig Typed(int id, PointDataType type, int register) =>
+        Point(id, type, 1, ModbusRegisterArea.HoldingRegister, register, 0);
 
     private static PointConfig Point(int id, PointDataType type, int slave, ModbusRegisterArea area, int register, int bitOffset) => new(
         PointId: id, PointCode: $"p{id}", PointName: $"点{id}", ColumnName: $"p{id}",

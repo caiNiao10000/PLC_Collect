@@ -189,7 +189,7 @@ public class FakePlcConnectionTests
                 [2] = [0x08],
             }),
         });
-        using var connection = new FakePlcConnection(script);
+        using var connection = new FakePlcConnection(script, ProtocolKind.S7);
         await connection.ConnectAsync(CancellationToken.None);
 
         var points = new[] { S7BoolPoint(1, bitOffset: 3), S7BoolPoint(2, bitOffset: 2) };
@@ -259,6 +259,188 @@ public class FakePlcConnectionTests
         connection.Dispose();
 
         connection.IsConnected.Should().BeFalse();
+    }
+
+    // ===== 以下为修复轮 1 补充：假连接必须与真实连接同一套协议语义与校验 =====
+
+    [Fact]
+    public async Task 默认扮演_Modbus_设备_纯_S7_点写坏值而不管脚本给了什么()
+    {
+        // 修复 3(a)：真实连接对 Modbus 为 null 的点写 NULL（它不负责该点）。
+        // 修复前假连接照脚本给值 → Plan 2 用假连接验证"按协议分发点集"会**假绿**。
+        var script = new FakePlcScript(new[]
+        {
+            new FakePlcResponse(false, false, null, new Dictionary<int, byte[]>
+            {
+                [1] = [0x00, 0x64], // 脚本"给了"这个 S7 点字节，但假连接扮演的是 Modbus 设备
+                [2] = [0x00, 0xC8],
+            }),
+        });
+        using var connection = new FakePlcConnection(script); // 默认 ProtocolKind.ModbusTcp
+        await connection.ConnectAsync(CancellationToken.None);
+
+        var points = new[] { S7BoolPoint(1, 0), Point(2) };
+
+        var result = await connection.ReadAsync(points, CancellationToken.None);
+
+        result.Values[points[0]].Should().BeNull("纯 S7 点不属于 Modbus 连接，与真实连接一致地写坏值");
+        result.Values[points[1]].Should().Be(200.0, "Modbus 点照常取值");
+    }
+
+    [Fact]
+    public async Task 扮演_S7_设备时_Modbus_点写坏值()
+    {
+        var script = new FakePlcScript(new[]
+        {
+            new FakePlcResponse(false, false, null, new Dictionary<int, byte[]>
+            {
+                [1] = [0x08],        // S7 位点：0x08 的位 3 是 1
+                [2] = [0x00, 0x64],  // Modbus 点：不属于 S7 连接
+            }),
+        });
+        using var connection = new FakePlcConnection(script, ProtocolKind.S7);
+        await connection.ConnectAsync(CancellationToken.None);
+
+        var points = new[] { S7BoolPoint(1, 3), Point(2) };
+
+        var result = await connection.ReadAsync(points, CancellationToken.None);
+
+        result.Values[points[0]].Should().Be(true, "假 S7 连接读 S7 点");
+        result.Values[points[1]].Should().BeNull("Modbus 点不属于 S7 连接，与真实连接一致地写坏值");
+    }
+
+    [Fact]
+    public async Task 脚本可以让读失败但连接保持()
+    {
+        // 修复 3(b)：真实连接里"从站用异常码拒绝"（SlaveException）的形态是
+        // **点是坏值、连接保持、LastError 记为 SlaveRejected**；采集器不该因此重连。
+        // 修复前假连接只有"读失败必断开"一种形态，Plan 2 用它验证重连策略会得出与真实设备相反的结论。
+        var script = new FakePlcScript(new[]
+        {
+            new FakePlcResponse(false, false, null, new Dictionary<int, byte[]>()),
+            new FakePlcResponse(false, true, "从站异常码 02（非法数据地址）", new Dictionary<int, byte[]>(), KeepConnected: true),
+        });
+        using var connection = new FakePlcConnection(script);
+        await connection.ConnectAsync(CancellationToken.None);
+
+        var points = new[] { Point(1) };
+        var result = await connection.ReadAsync(points, CancellationToken.None);
+
+        result.Values[points[0]].Should().BeNull();
+        connection.IsConnected.Should().BeTrue("坏块但连接保持——这正是 SlaveException 的形态");
+        connection.LastError.Should().NotBeNull();
+        connection.LastError!.Kind.Should().Be(ConnectionFailureKind.SlaveRejected);
+        connection.LastError.Message.Should().Contain("非法数据地址");
+    }
+
+    [Fact]
+    public async Task 读失败且不保持连接时_LastError_类别为_Transport()
+    {
+        var script = new FakePlcScript(new[]
+        {
+            new FakePlcResponse(false, false, null, new Dictionary<int, byte[]>()),
+            new FakePlcResponse(false, true, "读超时", new Dictionary<int, byte[]>()),
+        });
+        using var connection = new FakePlcConnection(script);
+        await connection.ConnectAsync(CancellationToken.None);
+
+        await connection.ReadAsync(new[] { Point(1) }, CancellationToken.None);
+
+        connection.IsConnected.Should().BeFalse();
+        connection.LastError!.Kind.Should().Be(ConnectionFailureKind.Transport);
+        connection.LastError.Message.Should().Be("读超时");
+    }
+
+    [Fact]
+    public async Task 连接失败也写入_LastError()
+    {
+        var script = new FakePlcScript(new[]
+        {
+            new FakePlcResponse(FailConnect: true, FailRead: false, ErrorMessage: "连接被拒绝", DataByPointId: new Dictionary<int, byte[]>()),
+        });
+        using var connection = new FakePlcConnection(script);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => connection.ConnectAsync(CancellationToken.None));
+
+        connection.LastError.Should().NotBeNull();
+        connection.LastError!.Kind.Should().Be(ConnectionFailureKind.Transport);
+        connection.LastError.Message.Should().Be("连接被拒绝");
+    }
+
+    [Fact]
+    public async Task 假连接拒绝非法位偏移_且被拒绝的调用不消耗脚本()
+    {
+        // 修复 3(引 M3)：假连接必须与真实连接**同样拒绝**非法配置，否则"同一份配置在假连接上能跑"
+        // 会让人以为它在真实连接上也能跑。
+        // 并且拒绝发生在消耗脚本之前——与真实连接"配置错误不发出任何请求"一致，
+        // 否则一次被拒绝的调用会让整条脚本序列错位一格（表现为"值不对"，像解码 bug）。
+        // 脚本刻意给三次不同的读响应：这样"消耗了几次"才是可观测的
+        // （只有两次时，"多消耗一次"会被脚本耗尽后的'重复返回最后一个'掩盖 → 变异测不出来）。
+        var script = new FakePlcScript(new[]
+        {
+            new FakePlcResponse(false, false, null, new Dictionary<int, byte[]>()),                       // 0: Connect
+            new FakePlcResponse(false, false, null, new Dictionary<int, byte[]> { [1] = [0x00, 0x64] }),  // 1: 100
+            new FakePlcResponse(false, false, null, new Dictionary<int, byte[]> { [1] = [0x00, 0xC8] }),  // 2: 200
+        });
+        using var connection = new FakePlcConnection(script);
+        await connection.ConnectAsync(CancellationToken.None);
+
+        var bad = new[] { ModbusBoolPoint(1, bitOffset: 16) };
+        var act = async () => await connection.ReadAsync(bad, CancellationToken.None);
+
+        await act.Should().ThrowAsync<ArgumentOutOfRangeException>().WithMessage("*0~15*");
+
+        var points = new[] { Point(1) };
+        var result = await connection.ReadAsync(points, CancellationToken.None);
+
+        result.Values[points[0]].Should().Be(100.0,
+            "被拒绝的调用没有消耗脚本：这次读到的是脚本第 1 项；若它消耗了，这里会变成第 2 项 200");
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(248)]
+    public async Task 假连接拒绝非法从站号(int slaveId)
+    {
+        var script = new FakePlcScript(new[] { new FakePlcResponse(false, false, null, new Dictionary<int, byte[]>()) });
+        using var connection = new FakePlcConnection(script);
+        await connection.ConnectAsync(CancellationToken.None);
+
+        var point = new PointConfig(
+            PointId: 1, PointCode: "p1", PointName: "点1", ColumnName: "p1",
+            DataType: PointDataType.Word, ByteOrder: ByteOrder.Big, Scale: 1.0, Offset: 0.0, Enabled: true,
+            S7: null, Modbus: new ModbusAddress(slaveId, ModbusRegisterArea.HoldingRegister, 100));
+
+        var act = async () => await connection.ReadAsync(new[] { point }, CancellationToken.None);
+
+        await act.Should().ThrowAsync<ArgumentOutOfRangeException>().WithMessage("*从站号*");
+    }
+
+    [Fact]
+    public async Task 假连接拒绝寄存器区里本期不支持的类型()
+    {
+        var script = new FakePlcScript(new[] { new FakePlcResponse(false, false, null, new Dictionary<int, byte[]>()) });
+        using var connection = new FakePlcConnection(script);
+        await connection.ConnectAsync(CancellationToken.None);
+
+        var point = new PointConfig(
+            PointId: 7, PointCode: "p7", PointName: "点7", ColumnName: "p7",
+            DataType: PointDataType.Dtl, ByteOrder: ByteOrder.Big, Scale: 1.0, Offset: 0.0, Enabled: true,
+            S7: null, Modbus: new ModbusAddress(1, ModbusRegisterArea.HoldingRegister, 100));
+
+        var act = async () => await connection.ReadAsync(new[] { point }, CancellationToken.None);
+
+        await act.Should().ThrowAsync<NotSupportedException>().WithMessage("*Dtl*").WithMessage("*p7*");
+    }
+
+    [Fact]
+    public void 未知协议值被拒绝()
+    {
+        var script = new FakePlcScript(new[] { new FakePlcResponse(false, false, null, new Dictionary<int, byte[]>()) });
+
+        var act = () => new FakePlcConnection(script, (ProtocolKind)999);
+
+        act.Should().Throw<ArgumentOutOfRangeException>().WithParameterName("protocol");
     }
 
     [Fact]
